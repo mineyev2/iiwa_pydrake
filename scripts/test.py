@@ -23,7 +23,14 @@ from pydrake.all import (
     UnitInertia,
     SceneGraphCollisionChecker,
     MinimumDistanceLowerBoundConstraint,
-    KinematicTrajectoryOptimization
+    KinematicTrajectoryOptimization,
+    Solve,
+    Meshcat,
+    Rgba,
+    RigidTransform,
+    BsplineBasis,
+    BsplineTrajectory,
+    KnotVectorType
 )
 
 from pydrake.systems.drawing import plot_system_graphviz
@@ -32,6 +39,46 @@ from pydrake.systems.primitives import FirstOrderLowPassFilter
 from iiwa_setup.iiwa import IiwaForwardKinematics, IiwaHardwareStationDiagram
 from iiwa_setup.motion_planning.toppra import reparameterize_with_toppra
 
+
+def draw_sphere(meshcat, name, position, radius=0.01):
+
+    rgba = Rgba(0.0, 1.0, 0.1, 0.5)
+
+    meshcat.SetObject(
+        name,
+        Sphere(radius),
+        rgba,
+    )
+    meshcat.SetTransform(
+        name,
+        RigidTransform(np.array(position)),
+    )
+
+def linear_bspline_for_trajopt(q_start, q_goal, num_control_points, duration=1.0, spline_order=3):
+    """
+    Creates a straight-line B-spline trajectory with exactly num_control_points
+    to match trajopt.
+    """
+    q_start = np.asarray(q_start)
+    q_goal = np.asarray(q_goal)
+    num_joints = q_start.shape[0]
+    
+    # Create linear interpolation at each control point
+    t_points = np.linspace(0, 1, num_control_points)
+    control_points = np.outer(1 - t_points, q_start) + np.outer(t_points, q_goal)  # shape: (num_control_points, num_joints)
+    control_points = control_points.T  # shape: (num_joints, num_control_points)
+    
+    # Make Bspline basis
+    from pydrake.math import BsplineBasis, KnotVectorType
+    basis = BsplineBasis(
+        order=spline_order,
+        num_basis_functions=num_control_points,
+        type=KnotVectorType.kClampedUniform,
+        initial_parameter_value=0.0,
+        final_parameter_value=duration
+    )
+    
+    return BsplineTrajectory(basis, control_points.tolist())
 
 def main(use_hardware: bool, has_wsg: bool) -> None:
     scenario_data = (
@@ -46,7 +93,7 @@ def main(use_hardware: bool, has_wsg: bool) -> None:
         parent: world
         child: sphere_obstacle::sphere_body
         X_PC:
-            translation: [0.5, 0, 0.5]
+            translation: [0.5, 0.1, 0.7]
     plant_config:
         # For some reason, this requires a small timestep
         time_step: 0.005
@@ -81,16 +128,6 @@ def main(use_hardware: bool, has_wsg: bool) -> None:
         )
     )
 
-
-    # num_iiwa_joints = controller_plant.num_positions()
-    # print("Number of iiwa joints:", num_iiwa_joints)
-    # filter = builder.AddSystem(FirstOrderLowPassFilter(
-    #     time_constant=1.00, size=num_iiwa_joints))
-
-    # builder.Connect(
-    #     teleop.get_output_port(), filter.get_input_port()
-    # )
-
     builder.Connect(
         teleop.get_output_port(), station.GetInputPort("iiwa.position"),
     )
@@ -115,59 +152,162 @@ def main(use_hardware: bool, has_wsg: bool) -> None:
     station.internal_meshcat.AddButton("Stop Simulation")
     station.internal_meshcat.AddButton("Move to Goal")
 
+
+    # ====================================================================
+    # Trajectory Optimization + TOPPRA Loop
+    # ====================================================================
+
+    # Define goal position and limits
+    q_goal = np.array([0, np.pi/2, 0.0, 0.0, 0.0, 0.0, 0.0])
+    vel_limits = np.full(7, 0.5)  # rad/s
+    acc_limits = np.full(7, 0.5)  # rad/s^2
+    
+    # Get optimization plant and context
+    optimization_plant = station.internal_station._optimization_plant
+    optimization_plant_context = station.internal_station._optimization_plant_context
+
+    # Set up trajectory optimization
+    num_control_points = 20
+    trajopt = KinematicTrajectoryOptimization(
+        num_positions=optimization_plant.num_positions(),
+        num_control_points=num_control_points,
+        # spline_order=2,
+    )
+    prog = trajopt.get_mutable_prog()
+
+    # Add collision constraints
+    min_distance = 0.01  # meters
+    for i in range(num_control_points):
+        qvars = trajopt.control_points()[:, i]
+        print("Current qvars:", qvars)
+
+        constraint = MinimumDistanceLowerBoundConstraint(
+            plant=optimization_plant,
+            bound=min_distance,
+            plant_context=optimization_plant_context,
+        )
+
+        prog.AddConstraint(constraint, qvars)
     
 
-    q_goal = np.array([0, np.pi/2, 0.0, 0.0, 0.0, 0.0, 0.0])
-    vel_limits = np.full(7, 0.2)  # rad/s
-    acc_limits = np.full(7, 0.2)  # rad/s^2
-
-    move_clicks = 0
+    # ====================================================================
+    # Main Simulation Loop
+    # ====================================================================
+    move_clicks = -1
+    trajectory = None
+    trajectory_start_time = 0.0
     while station.internal_meshcat.GetButtonClicks("Stop Simulation") < 1:
-        if station.internal_meshcat.GetButtonClicks("Move to Goal") > move_clicks:
-            move_clicks = station.internal_meshcat.GetButtonClicks("Move to Goal")
-            print(f"Moving to goal: {q_goal}")
-            
+        # Check if "Move to Goal" button was clicked
+        new_move_clicks = station.internal_meshcat.GetButtonClicks("Move to Goal")
+        if new_move_clicks > move_clicks:
+            move_clicks = new_move_clicks
+            print("Planning trajectory to goal...")
+
             # 1. Get current position
-            # Get the real-time context for the station
             station_context = station.GetMyContextFromRoot(simulator.get_context())
-            # Read the measured position from the station (works for both Sim and Hardware)
             q_current = station.GetOutputPort("iiwa.position_measured").Eval(station_context)
-            print("Current joint positions:", q_current)
             
-            # 2. Kinematic Trajectory Optimization
-            print("Running Trajectory Optimization...")
+            # 2. Add extra constraints and costs
+            linear_bspline = linear_bspline_for_trajopt(q_current, q_goal, duration=1.0, spline_order=3, num_control_points=num_control_points)
+            trajopt.SetInitialGuess(linear_bspline)
             
-            trajopt = KinematicTrajectoryOptimization(
-                controller_plant.num_positions(), 
-                num_control_points=10
+            # Position
+            trajopt.AddPathPositionConstraint(q_current, q_current, 0.0)
+            trajopt.AddPathPositionConstraint(q_goal, q_goal, 1.0)
+            # Velocity (TOPPRA assumes zero start and end velocities)
+            trajopt.AddPathVelocityConstraint(
+                np.zeros_like(q_current), np.zeros_like(q_current), 0.0
             )
-            prog = trajopt.get_mutable_prog()
-            
-            # Constraints: Start and Goal
-            prog.AddBoundingBoxConstraint(q_current, q_current, trajopt.control_points()[:, 0])
-            prog.AddBoundingBoxConstraint(q_goal, q_goal, trajopt.control_points()[:, -1])
-            
-            # Constraint: Collision Avoidance
-            # We need a context for the controller_plant to evaluate collisions
-            controller_plant_context = controller_plant.CreateDefaultContext()
-            
-            collision_constraint = MinimumDistanceLowerBoundConstraint(
-                controller_plant,
-                0.01, # Buffer distance (meters)
-                controller_plant_context,
-                None,
-                0.1   # Influence distance
+            trajopt.AddPathVelocityConstraint(
+                np.zeros_like(q_goal), np.zeros_like(q_goal), 1.0
             )
-            
-            # Apply collision check to all control points
-            for i in range(trajopt.num_control_points()):
-                prog.AddConstraint(collision_constraint, trajopt.control_points()[:, i])
+            # Costs
+            trajopt.AddPathLengthCost(1.0)
+            # trajopt.AddDurationCost(1.0)
 
+            # 3. Solve optimization
             result = Solve(prog)
-            
-            print("Goal reached.")
 
+            internal_plant = station.get_internal_plant()
+            internal_context = station.get_internal_plant_context()
+
+            for i in range(num_control_points):
+                q_sol = result.GetSolution(trajopt.control_points()[:, i])
+
+                # TODO: Draw robot points along path for debugging
+                internal_plant.SetPositions(internal_context, q_sol)
+                X_WB = internal_plant.EvalBodyPoseInWorld(
+                    internal_context,
+                    internal_plant.GetBodyByName("iiwa_link_7"),
+                )
+                sphere_name = f"traj_point_{i}"
+                draw_sphere(
+                    station.internal_meshcat,
+                    sphere_name,
+                    X_WB.translation(),
+                )
+
+            if not result.is_success():
+                print("Optimization failed!")
+                continue
+
+            print("Trajectory optimization succeeded!")
+            geometric_path = trajopt.ReconstructTrajectory(result)
+
+            # 4. Save path as img through matplotlib
+            ts = np.linspace(geometric_path.start_time(), geometric_path.end_time(), 100)
+            qs = np.array([geometric_path.value(t) for t in ts])
+            plt.figure()
+            for i in range(qs.shape[1]):
+                plt.plot(ts, qs[:, i], label=f"Joint {i+1}")
+            plt.xlabel("Time [s]")
+            plt.ylabel("Joint Position [rad]")
+            plt.title("Geometric Path Joint Positions")
+            plt.legend()
+            plt.savefig("geometric_path.png")
+            plt.close()
+
+            # 5. Reparameterize with TOPPRA
+            trajectory = reparameterize_with_toppra(
+                geometric_path,
+                controller_plant, # NOTE: don't need optimization_plant since collision avoidance is solved
+                velocity_limits=vel_limits,
+                acceleration_limits=acc_limits,
+            )
+
+            # 6. Save reparameterized trajectory as img through matplotlib
+            ts = np.linspace(trajectory.start_time(), trajectory.end_time(), 100)
+            qs = np.array([trajectory.value(t) for t in ts])
+            plt.figure()
+            for i in range(qs.shape[1]):
+                plt.plot(ts, qs[:, i], label=f"Joint {i+1}")
+            plt.xlabel("Time [s]")
+            plt.ylabel("Joint Position [rad]")
+            plt.title("Reparameterized Trajectory Joint Positions")
+            plt.legend()
+            plt.savefig("reparameterized_trajectory.png")
+            plt.close()
+
+            print(f"✓ TOPPRA succeeded! Trajectory duration: {trajectory.end_time():.2f}s")
+            trajectory_start_time = simulator.get_context().get_time()
+
+        # If we have a trajectory, execute it
+        if trajectory is not None:
+            current_time = simulator.get_context().get_time()
+            traj_time = current_time - trajectory_start_time
+            
+            if traj_time <= trajectory.end_time():
+                q_desired = trajectory.value(traj_time)
+                station_context = station.GetMyMutableContextFromRoot(
+                    simulator.get_mutable_context()
+                )
+                station.GetInputPort("iiwa.position").FixValue(station_context, q_desired)
+            else:
+                print("✓ Trajectory execution complete!")
+                trajectory = None
+        
         simulator.AdvanceTo(simulator.get_context().get_time() + 0.1)
+
     station.internal_meshcat.DeleteButton("Stop Simulation")
     station.internal_meshcat.DeleteButton("Move to Goal")
 

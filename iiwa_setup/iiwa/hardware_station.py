@@ -39,6 +39,7 @@ from pydrake.all import (
     State,
     position_enabled,
     torque_enabled,
+    AddMultibodyPlantSceneGraph
 )
 
 from iiwa_setup.util import get_package_xmls
@@ -197,7 +198,7 @@ class InternalStationDiagram(Diagram):
         self._plant.set_name("internal_plant")
         self._scene_graph = builder.AddNamedSystem("scene_graph", SceneGraph())
         self._plant.RegisterAsSourceForSceneGraph(self._scene_graph)
-
+                
         parser = Parser(self._plant)
         for p in package_xmls:
             parser.package_map().AddPackageXml(p)
@@ -234,22 +235,75 @@ class InternalStationDiagram(Diagram):
 
         # Make the plant for the iiwa controller
         self._iiwa_controller_plant = MultibodyPlant(time_step=self._plant.time_step())
-        # controller_iiwa = AddIiwa(self._iiwa_controller_plant)
-        # if has_wsg:
-        #     AddWsg(self._iiwa_controller_plant, controller_iiwa, welded=True)
-
-        controller_parser = Parser(self._iiwa_controller_plant)
-        for p in package_xmls:
-            controller_parser.package_map().AddPackageXml(p)
-        ConfigureParser(controller_parser)
+        controller_iiwa = AddIiwa(self._iiwa_controller_plant)
+        if has_wsg:
+            AddWsg(self._iiwa_controller_plant, controller_iiwa, welded=True)
         
-        # Process the same directives used for the simulation
+        self._iiwa_controller_plant.Finalize()
+
+        # =====================================================
+        # Setup optimization plant (to not connect to diagram)
+        # self._optimization_plant = MultibodyPlant(time_step=self._plant.time_step())
+        # self._optimization_scene_graph = SceneGraph()
+        # self._optimization_plant.RegisterAsSourceForSceneGraph(self._optimization_scene_graph)
+        
+        # opt_parser = Parser(self._optimization_plant)
+        # for p in package_xmls:
+        #     opt_parser.package_map().AddPackageXml(p)
+        # ConfigureParser(opt_parser)
+
+        # # Load the same models as the internal plant
+        # ProcessModelDirectives(
+        #     directives=ModelDirectives(directives=scenario.directives),
+        #     parser=opt_parser,
+        # )
+        
+        # self._optimization_plant.Finalize()
+
+        # Connect the optimization plant to its scene graph
+        # temp_builder = DiagramBuilder()
+        # temp_plant_sys = temp_builder.AddSystem(self._optimization_plant)
+        # temp_sg_sys = temp_builder.AddSystem(self._optimization_scene_graph)
+        # temp_builder.Connect(
+        #     temp_sg_sys.get_query_output_port(),
+        #     temp_plant_sys.get_geometry_query_input_port()
+        # )
+
+        # self._optimization_diagram = temp_builder.Build()
+        # self._optimization_diagram_context = self._optimization_diagram.CreateDefaultContext()
+        # self._optimization_plant_context = self._optimization_diagram.GetSubsystemContext(
+        #     self._optimization_plant, self._optimization_diagram_context
+        # )
+
+        temp_builder = DiagramBuilder()
+        self._optimization_plant, self._optimization_scene_graph = AddMultibodyPlantSceneGraph(
+            temp_builder,
+            time_step=0.0  # Continuous time for optimization
+        )
+
+        # Load the same models as the internal plant
+        opt_parser = Parser(self._optimization_plant)
+        for p in package_xmls:
+            opt_parser.package_map().AddPackageXml(p)
+        ConfigureParser(opt_parser)
+        
         ProcessModelDirectives(
             directives=ModelDirectives(directives=scenario.directives),
-            parser=controller_parser,
+            parser=opt_parser,
         )
-            
-        self._iiwa_controller_plant.Finalize()
+        
+        # Finalize the plant BEFORE building the diagram
+        self._optimization_plant.Finalize()
+
+        # Build the diagram (this creates a mini-diagram just for collision queries)
+        self._optimization_diagram = temp_builder.Build()
+        
+        # Create contexts
+        self._optimization_diagram_context = self._optimization_diagram.CreateDefaultContext()
+        self._optimization_plant_context = self._optimization_diagram.GetSubsystemContext(
+            self._optimization_plant, self._optimization_diagram_context
+        )
+        # =====================================================
 
         # Export input ports
         builder.ExportInput(

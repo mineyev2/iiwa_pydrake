@@ -1,7 +1,6 @@
 import numpy as np
 
-from pydrake.all import MultibodyPlant, PathParameterizedTrajectory, Toppra, Trajectory
-
+from pydrake.all import MultibodyPlant, PathParameterizedTrajectory, Toppra, Trajectory, BsplineTrajectory
 
 def reparameterize_with_toppra(
     trajectory: Trajectory,
@@ -27,6 +26,10 @@ def reparameterize_with_toppra(
     Returns:
         PathParameterizedTrajectory: The reparameterized trajectory.
     """
+
+    # print("start time:", trajectory.start_time())
+    # print("end time:", trajectory.end_time())
+    
     toppra = Toppra(
         path=trajectory,
         plant=plant,
