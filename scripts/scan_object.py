@@ -41,7 +41,11 @@ from iiwa_setup.util.traj_planning import compute_simple_traj_from_q1_to_q2
 from iiwa_setup.util.visualizations import draw_sphere
 
 # Personal files
-from scripts.hemisphere_solver import SphereScorer, generate_hemisphere_joint_poses
+from scripts.hemisphere_solver import (
+    SphereScorer,
+    find_best_hemisphere_center,
+    generate_hemisphere_joint_poses,
+)
 from scripts.kuka_geo_kin import KinematicsSolver
 
 
@@ -149,13 +153,13 @@ def main(use_hardware: bool) -> None:
     # Compute all joint poses for sphere scanning
     # ====================================================================
     # Solve example IK
-    hemisphere_pos = np.array([0.6, 0.0, 0.3])
-    draw_sphere(
-        station.internal_meshcat,
-        "target_sphere",
-        position=hemisphere_pos,
-        radius=0.02,
-    )
+    # hemisphere_pos = np.array([0.6, 0.0, 0.1])
+    # draw_sphere(
+    #     station.internal_meshcat,
+    #     "target_sphere",
+    #     position=hemisphere_pos,
+    #     radius=0.02,
+    # )
 
     kinematics_solver = KinematicsSolver(station)
     # test = generate_hemisphere_joint_poses(
@@ -166,9 +170,31 @@ def main(use_hardware: bool) -> None:
     #     num_rotations_per_pose=7,
     #     num_elbow_positions=10,
     #     kinematics_solver=kinematics_solver,
-    #     simulator=simulator,
     # )
-    sphere_scorer = SphereScorer(station, kinematics_solver)
+
+    hemisphere_centers = []
+    hemisphere_radius = 0.05
+    point_density = 5
+
+    x_points = np.linspace(0, 1.0, point_density)
+    y_points = np.array([0])
+    z_points = np.linspace(0.0, 1.0, point_density)
+    hemisphere_centers = []
+    for x in x_points:
+        for y in y_points:
+            for z in z_points:
+                hemisphere_centers.append(np.array([x, y, z]))
+
+    find_best_hemisphere_center(
+        station=station,
+        hemisphere_centers=hemisphere_centers,
+        radius=hemisphere_radius,
+        num_poses=30,
+        num_rotations_per_pose=7,
+        num_elbow_positions=10,
+        kinematics_solver=kinematics_solver,
+    )
+    # sphere_scorer = SphereScorer(station, kinematics_solver)
 
     # ====================================================================
     # Main Simulation Loop
@@ -180,14 +206,14 @@ def main(use_hardware: bool) -> None:
 
             # test if self-collision
             # Get current q through teleop values
-            teleop_context = diagram.GetSubsystemContext(
-                teleop, simulator.get_context()
-            )
-            q_current = teleop.get_output_port().Eval(teleop_context)
-            print("Current joint positions:", q_current)
+            # teleop_context = diagram.GetSubsystemContext(
+            #     teleop, simulator.get_context()
+            # )
+            # q_current = teleop.get_output_port().Eval(teleop_context)
+            # print("Current joint positions:", q_current)
 
-            collision = sphere_scorer.is_in_self_collision(q_current)
-            print("Self-collision:", collision)
+            # collision = sphere_scorer.is_in_self_collision(q_current)
+            # print("Self-collision:", collision)
 
         simulator.AdvanceTo(simulator.get_context().get_time() + 0.1)
 

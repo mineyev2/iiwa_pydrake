@@ -4,7 +4,7 @@ Hemisphere scanning solver
 Authors: Roman Mineyev
 """
 
-import time
+import csv
 
 # Other
 from pathlib import Path
@@ -106,6 +106,10 @@ class SphereScorer:
         # Frame
         self.tip_frame = self.optimization_plant.GetFrameByName("microscope_tip_link")
 
+        # Joint limits
+        self.joint_lower_limits = self.optimization_plant.GetPositionLowerLimits()
+        self.joint_upper_limits = self.optimization_plant.GetPositionUpperLimits()
+
     # ===================================================================
     # Cost function components
     # ===================================================================
@@ -116,7 +120,7 @@ class SphereScorer:
         2. End-effector position distance: Curr node's end-effector distance from desired pose.
         3. End-effector rotation distance: Curr node's end-effector rotation distance from desired pose.
 
-        Args
+        Args:
             prev_node (Node): Starting node.
             curr_node (Node): Ending node.
 
@@ -128,7 +132,7 @@ class SphereScorer:
             self.w_joint_dist * self.joint_distance(prev_node, curr_node)
             + self.w_eef_pos_dist * curr_node.eef_pos_distance
             + self.w_eef_rot_dist * curr_node.eef_rot_distance
-            + self.w_manipulability * curr_node.manipulability
+            # + self.w_manipulability * curr_node.manipulability
         )
 
         return cost
@@ -170,15 +174,25 @@ class SphereScorer:
         return np.linalg.norm(node2.q - node1.q)
 
     def is_within_joint_limits(self, q):
-        pass
+        # print("Joint limits check:")
+        # print(" lower limits:", self.joint_lower_limits)
+        # print(" upper limits:", self.joint_upper_limits)
+        # print(" current q:", q)
+        is_within = np.all(q >= self.joint_lower_limits) and np.all(
+            q <= self.joint_upper_limits
+        )
+        # print(" within limits:", is_within)
+        # # if not, print which joint(s) are not within limits
+        # if not is_within:
+        #     for i in range(len(q)):
+        #         if q[i] < self.joint_lower_limits[i]:
+        #             print(f" Joint {i+1} below lower limit: {q[i]:.4f} < {self.joint_lower_limits[i]:.4f}")
+        #         if q[i] > self.joint_upper_limits[i]:
+        #             print(f" Joint {i+1} above upper limit: {q[i]:.4f} > {self.joint_upper_limits[i]:.4f}")
+        # # input()
+        return is_within
 
     def is_in_self_collision(self, q):
-        # # 1) Set context to q
-        # self.optimization_plant.SetPositions(self.internal_pla, q)
-        # # 2) Call scene graph to check for collisions given this new context
-        # query_object = self.optimization_plant_sg.get_query_output_port().Eval(scene_graph_context)
-        # has_collision = query_object.HasCollisions()
-
         # 1) Set context to q
         self.optimization_plant.SetPositions(self.optimization_plant_context, q)
         # 2) Call scene graph to check for collisions given this new context
@@ -189,14 +203,44 @@ class SphereScorer:
         # 3) Visualize for sanity check
 
         self.optimization_diagram.ForcedPublish(self.optimization_diagram_context)
-        print(f"Visualizing q: {q}")
-        print(f"Collision: {has_collision}")
-        time.sleep(0.01)  # Pause to let you see it
+        # print(f"Visualizing q: {q}")
+        # print(f"Collision: {has_collision}")
+        # time.sleep(0.01)  # Pause to let you see it
 
-        print("Is there a collision?", has_collision)
+        # print("Is there a collision?", has_collision)
         return has_collision
 
-    def generate_graph(self, waypoints, num_elbow_angles=1, simulator=None):
+    def djikstra_search(self, layers):
+        # Initialize start nodes (first layer)
+        for node in layers[0]:
+            node.cost = 0
+
+        # Process layers
+        for layer_idx in range(1, len(layers)):
+            current_layer = layers[layer_idx]
+            previous_layer = layers[layer_idx - 1]
+
+            for curr_node in current_layer:
+                for prev_node in previous_layer:
+                    cost = prev_node.cost + self.edge_cost(prev_node, curr_node)
+                    if cost < curr_node.cost:
+                        curr_node.cost = cost
+                        curr_node.prev = prev_node
+
+        # Backtrack to find best path
+        end_layer = layers[-1]
+        best_end_node = min(end_layer, key=lambda node: node.cost)
+
+        path = []
+        current_node = best_end_node
+        while current_node is not None:
+            path.append(current_node)
+            current_node = current_node.prev
+        path.reverse()
+
+        return path, best_end_node.cost
+
+    def generate_graph(self, waypoints, num_elbow_angles=1):
         """
         Generate graph of IK solutions for hemisphere scanning. This graph is traversed with Dijksra's
         later to find the optimal path.
@@ -263,26 +307,26 @@ class SphereScorer:
                         target_pose, microscope_tip_pose
                     )
 
-                    # Debug: Print first waypoint errors
-                    if layer_idx == 0 and node_idx == 0 and sol_idx == 0:
-                        print(
-                            colored(
-                                "\n=== Debug: First waypoint IK/FK validation ===",
-                                "yellow",
-                            )
-                        )
-                        print(f"Target position: {target_pos}")
-                        print(f"FK position:     {microscope_tip_pos}")
-                        print(f"Position error:  {eef_pos_dist:.6f} m")
-                        print(
-                            f"Rotation error:  {eef_rot_dist:.6f} rad ({np.degrees(eef_rot_dist):.3f}°)"
-                        )
-                        print(
-                            colored(
-                                "==============================================\n",
-                                "yellow",
-                            )
-                        )
+                    # # Debug: Print first waypoint errors
+                    # if layer_idx == 0 and node_idx == 0 and sol_idx == 0:
+                    #     print(
+                    #         colored(
+                    #             "\n=== Debug: First waypoint IK/FK validation ===",
+                    #             "yellow",
+                    #         )
+                    #     )
+                    #     print(f"Target position: {target_pos}")
+                    #     print(f"FK position:     {microscope_tip_pos}")
+                    #     print(f"Position error:  {eef_pos_dist:.6f} m")
+                    #     print(
+                    #         f"Rotation error:  {eef_rot_dist:.6f} rad ({np.degrees(eef_rot_dist):.3f}°)"
+                    #     )
+                    #     print(
+                    #         colored(
+                    #             "==============================================\n",
+                    #             "yellow",
+                    #         )
+                    #     )
 
                     node = Node(
                         q=q_sol,
@@ -293,21 +337,11 @@ class SphereScorer:
                         node_idx=node_idx,
                     )
 
-                    # Check joint limits
-                    if self.is_within_joint_limits(q_sol):
-                        node.is_within_joint_limits = True
-
-                    # Check self-collision
-                    # full_q_sol = np.concatenate((right_joint_positions, q_sol))
-                    # is_in_self_collision = (
-                    #     robot_interface.safety_manager.collision_exists(
-                    #         robot_interface.env, full_q_sol
-                    #     )
-                    # )
-
+                    # Check joint limits and self-collision
+                    node.is_within_joint_limits = self.is_within_joint_limits(q_sol)
                     node.is_in_self_collision = self.is_in_self_collision(
-                        q_sol, simulator=simulator
-                    )  # TODO: Integrate with aboce, since it already runs SetPositions()
+                        q_sol
+                    )  # TODO: Integrate with above, since it already runs SetPositions()
 
                     # Add manipulability score
                     # node.manipulability = self.manipulability_score(q_sol)
@@ -323,17 +357,26 @@ class SphereScorer:
 
             # Filter out nodes as needed
             total_sols = len(layer_nodes)
-
-            # # Filter out self-collisions
+            num_self_collision_sols = np.sum(
+                [1 for node in layer_nodes if node.is_in_self_collision]
+            )
+            num_invalid_joint_limit_sols = np.sum(
+                [1 for node in layer_nodes if not node.is_within_joint_limits]
+            )
+            # Filter out joint limit violations
+            layer_nodes = [node for node in layer_nodes if node.is_within_joint_limits]
+            # Filter out self-collisions
             layer_nodes = [
                 node for node in layer_nodes if not node.is_in_self_collision
             ]
-            num_self_collision_sols = total_sols - len(layer_nodes)
 
             # Cool visualization of total solutions vs. valid solutions
             print(colored("Layer " + str(layer_idx) + " solutions breakdown:", "cyan"))
             print(f"  Total IK solutions:                 {total_sols}")
-            print(f"  Self-collision solutions:          -{num_self_collision_sols}")
+            print(f"  Self-collision solutions:          {num_self_collision_sols}")
+            print(
+                f"  Invalid joint limit solutions:     {num_invalid_joint_limit_sols}"
+            )
             print(f"                                    _____")
             print(f"  Valid solutions remaining:         ={len(layer_nodes)}\n")
             print(
@@ -353,7 +396,7 @@ class SphereScorer:
                         "red",
                     )
                 )
-                return [], None, None
+                return [], -1, -1
 
             layers.append(layer_nodes)
 
@@ -466,6 +509,26 @@ def generate_hemisphere_waypoints(center, radius, num_points, num_rotations):
             waypoints_array[i, rot_idx, :3] = point_global
             waypoints_array[i, rot_idx, 3:] = quat
 
+    # ===================================================================
+    # Rotate hemisphere to bulge toward -x instead of +z
+    # ===================================================================
+    # Rotation matrix: 90 degrees around y-axis to transform +z → -x
+    R_y_90 = np.array([[0, 0, -1], [0, 1, 0], [1, 0, 0]])
+
+    for i in range(waypoints_array.shape[0]):
+        for j in range(waypoints_array.shape[1]):
+            # Rotate position (relative to center)
+            pos_relative = waypoints_array[i, j, :3] - center
+            pos_rotated = R_y_90 @ pos_relative
+            waypoints_array[i, j, :3] = pos_rotated + center
+
+            # Rotate orientation quaternion
+            quat = waypoints_array[i, j, 3:]
+            rot_original = Rotation.from_quat(quat)
+            rot_transform = Rotation.from_matrix(R_y_90)
+            rot_new = rot_transform * rot_original
+            waypoints_array[i, j, 3:] = rot_new.as_quat()
+
     return waypoints_array
 
 
@@ -483,7 +546,7 @@ def plot_hemisphere_waypoints(
         save_path (str or Path, optional): Path to save the plot image
         save_plot (bool): Whether to save the plot to file
     """
-    fig = plt.figure(figsizekinematics_solver=(14, 12))
+    fig = plt.figure(figsize=(14, 12))
     ax = fig.add_subplot(111, projection="3d")
 
     # Extract positions for plotting (flatten first two dimensions)
@@ -634,7 +697,6 @@ def generate_hemisphere_joint_poses(
     num_rotations_per_pose: int,
     num_elbow_positions: int,
     kinematics_solver=None,
-    simulator=None,
 ):
     """
     Generate joint poses for scanning hemisphere, while optimizing these parameters:
@@ -663,6 +725,7 @@ def generate_hemisphere_joint_poses(
             center, waypoints, radius, output_plot, save_plot=save_plot
         )
         print("Plot generation complete.")
+        quit()
 
     # ===================================================================
     # Create graph for evaluating least-cost path
@@ -670,13 +733,126 @@ def generate_hemisphere_joint_poses(
     layers, avg_eef_pos_dist, avg_eef_rot_dist = sphere_scorer.generate_graph(
         waypoints,
         num_elbow_angles=num_elbow_positions,
-        simulator=simulator,
     )
 
     # ===================================================================
     # Find least-cost path through graph
     # ===================================================================
+    if layers == []:
+        return np.inf, []
 
+    # Step 3: Compute costs and find optimal path (Dijkstra's or A* algorithm)
+    path, cost = sphere_scorer.djikstra_search(layers)
+
+    # Print running averages
+    print(colored("\n=== Running Averages Across All Configurations ===", "magenta"))
+    print(f"Average EEF Position Distance: {avg_eef_pos_dist:.6f} m")
+    print(
+        f"Average EEF Rotation Distance: {avg_eef_rot_dist:.6f} rad ({np.degrees(avg_eef_rot_dist):.3f}°)"
+    )
+    print(colored("=================================================\n", "magenta"))
+
+    return cost, path
+
+
+def find_best_hemisphere_center(
+    station: IiwaHardwareStationDiagram,
+    hemisphere_centers: list,
+    radius: float,
+    num_poses: int,
+    num_rotations_per_pose: int,
+    num_elbow_positions: int,
+    kinematics_solver=None,
+):
+    """
+    Evaluate multiple hemisphere centers and return the one with the lowest cost path.
+
+    Args:
+        station (IiwaHardwareStationDiagram): Station from hardware_station.py
+        hemisphere_centers (list): List of hemisphere center positions, each as np.ndarray [x, y, z]
+        radius (float): Radius of the hemisphere
+        num_poses (int): Number of waypoints on hemisphere
+        num_rotations_per_pose (int): Number of rotations per waypoint
+        num_elbow_positions (int): Number of elbow angles to sample
+        kinematics_solver (KinematicsSolver, optional): Kinematics solver instance
+
+    Returns:
+        tuple: (best_center, best_cost, best_path)
+            - best_center (np.ndarray): The hemisphere center with lowest cost
+            - best_cost (float): The cost of the best path
+            - best_path (list): The path nodes for the best solution
+    """
+    if not hemisphere_centers:
+        raise ValueError("hemisphere_centers list cannot be empty")
+
+    best_center = None
+    best_cost = np.inf
+    best_path = []
+    results = []  # Store results for CSV
+
+    print(colored(f"\n{'='*60}", "cyan"))
+    print(
+        colored(f"Evaluating {len(hemisphere_centers)} hemisphere centers...", "cyan")
+    )
+    print(colored(f"{'='*60}\n", "cyan"))
+
+    for idx, center in enumerate(hemisphere_centers):
+        print(
+            colored(
+                f"\n--- Testing Center {idx + 1}/{len(hemisphere_centers)}: {center} ---",
+                "yellow",
+            )
+        )
+
+        cost, path = generate_hemisphere_joint_poses(
+            station=station,
+            center=center,
+            radius=radius,
+            num_poses=num_poses,
+            num_rotations_per_pose=num_rotations_per_pose,
+            num_elbow_positions=num_elbow_positions,
+            kinematics_solver=kinematics_solver,
+        )
+
+        print(colored(f"Center {idx + 1} cost: {cost:.6f}", "yellow"))
+
+        # Store results
+        results.append(
+            {
+                "center_x": center[0],
+                "center_y": center[1],
+                "center_z": center[2],
+                "cost": cost,
+                "num_nodes": len(path) if path else 0,
+            }
+        )
+
+        if cost < best_cost:
+            best_cost = cost
+            best_center = center
+            best_path = path
+            print(colored(f"✓ New best center found!", "green"))
+
+    # Save results to CSV
+    outputs_dir = Path(__file__).parent.parent / "outputs"
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = outputs_dir / "hemisphere_center_costs.csv"
+
+    with open(csv_path, "w", newline="") as csvfile:
+        fieldnames = ["center_x", "center_y", "center_z", "cost", "num_nodes"]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
+
+    print(colored(f"\nResults saved to: {csv_path}", "blue"))
+
+    print(colored(f"\n{'='*60}", "cyan"))
+    print(colored(f"Best hemisphere center: {best_center}", "green"))
+    print(colored(f"Best cost: {best_cost:.6f}", "green"))
+    print(colored(f"Path length: {len(best_path)} nodes", "green"))
+    print(colored(f"{'='*60}\n", "cyan"))
+
+    return best_center, best_cost, best_path
     # ===================================================================
     # Debugging
     # ===================================================================
