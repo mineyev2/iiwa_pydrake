@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import glob  # for data search
 import os
 import time
@@ -582,18 +583,60 @@ def leave_one_out_reprojection_error():
 
 if __name__ == "__main__":
     np.set_printoptions(suppress=True)
-    camera_source = 4
-    checkersize = 2
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Camera calibration using checkerboard pattern",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+            Examples:
+            python camera_calibration.py --source 4 --size 25
+            python camera_calibration.py --source 0 --size 20
+            """,
+    )
+    parser.add_argument(
+        "--source",
+        type=int,
+        required=True,
+        help="Camera source device number (e.g., 0, 4)",
+    )
+    parser.add_argument(
+        "--size",
+        type=float,
+        required=True,
+        help="Checkerboard square size in millimeters (e.g., 25)",
+    )
+    parser.add_argument(
+        "--capture",
+        action="store_true",
+        help="Capture new images from camera (default: load from existing images)",
+    )
+
+    args = parser.parse_args()
+
+    camera_source = args.source
+    checkersize = args.size
     current_path = os.path.abspath(__file__)
     current_dir = os.path.dirname(current_path)
     data_path = os.path.join(
-        current_dir, "calibration_data", "calibration_images", "2mm_most_zoomed_out"
+        current_dir,
+        "calibration_data",
+        "calibration_images",
+        f"{int(checkersize)}mm_calibration",
     )
     calib_path = os.path.join(current_dir, "calibration_data", "calibration_results")
 
     # obtain calibration images
-    # objpoints, imgpoints, frame = fetching_from_camera(camera_source, data_path, checkersize)
-    objpoints, imgpoints, frame = fetching_from_file(data_path, checkersize)
+    if args.capture:
+        print(
+            f"Capturing images from camera {camera_source} with {checkersize}mm squares..."
+        )
+        objpoints, imgpoints, frame = fetching_from_camera(
+            camera_source, data_path, checkersize
+        )
+    else:
+        print(f"Loading images from {data_path} with {checkersize}mm squares...")
+        objpoints, imgpoints, frame = fetching_from_file(data_path, checkersize)
     gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
 
     # obtain camera matrix, distorion factor
