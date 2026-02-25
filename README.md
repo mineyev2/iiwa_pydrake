@@ -40,6 +40,13 @@ git-lfs install
 git-lfs pull
 ```
 
+## Other Dependencies
+You may also need to install the following:
+```
+sudo apt update
+sudo apt install python3-tk
+```
+
 ### iiwa Driver
 
 [Drake's iiwa driver](https://github.com/RobotLocomotion/drake-iiwa-driver) must be

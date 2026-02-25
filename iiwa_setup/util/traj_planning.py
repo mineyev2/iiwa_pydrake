@@ -251,8 +251,10 @@ def create_traj_from_q1_to_q2(
     result = Solve(prog)
 
     if not result.is_success():
-        print("Trajectory optimization failed!")
-        return None
+        error_msg = f"Trajectory optimization failed! Solver status: {result.get_solver_id().name()}"
+        if result.get_solution_result():
+            error_msg += f" - {result.get_solution_result()}"
+        raise RuntimeError(error_msg)
 
     print("Trajectory optimization succeeded!")
 
