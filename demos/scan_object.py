@@ -1291,6 +1291,7 @@ def main(use_hardware: bool) -> None:
 
     # Button management
     num_move_to_top_clicks = 0
+    num_compute_iks_clicks = 0
     num_execute_traj_clicks = 0
 
     # IK computation thread state
@@ -1354,15 +1355,15 @@ def main(use_hardware: bool) -> None:
                 trajectory_start_time = simulator.get_context().get_time()
                 state = State.MOVING_TO_START
         elif state == State.WAITING_FOR_NEXT_SCAN:
-            if (
-                station.internal_meshcat.GetButtonClicks("Execute Trajectory")
-                > num_execute_traj_clicks
-            ):
-                num_execute_traj_clicks = station.internal_meshcat.GetButtonClicks(
-                    "Execute Trajectory"
-                )
-            else:
-                continue
+            # if (
+            #     station.internal_meshcat.GetButtonClicks("Compute IKs")
+            #     > num_compute_iks_clicks
+            # ):
+            #     num_compute_iks_clicks = station.internal_meshcat.GetButtonClicks(
+            #         "Compute IKs"
+            #     )
+            # else:
+            #     continue
 
             if scan_idx >= len(hemisphere_waypoints):
                 print(colored("✓ All scans complete!", "green"))
@@ -1431,7 +1432,16 @@ def main(use_hardware: bool) -> None:
 
         elif state == State.COMPUTING_IKS:
             # Wait for IK computation to complete
-            if hemisphere_ik_result["ready"] and optical_axis_ik_result["ready"]:
+            if (
+                hemisphere_ik_result["ready"]
+                and optical_axis_ik_result["ready"]
+                and station.internal_meshcat.GetButtonClicks("Execute Trajectory")
+                > num_execute_traj_clicks
+            ):
+                num_execute_traj_clicks = station.internal_meshcat.GetButtonClicks(
+                    "Execute Trajectory"
+                )
+
                 hemisphere_trajectory = hemisphere_ik_result["trajectory"]
                 optical_axis_trajectory = optical_axis_ik_result["trajectory"]
 
@@ -1537,6 +1547,11 @@ def main(use_hardware: bool) -> None:
         num_move_to_top_clicks = station.internal_meshcat.GetButtonClicks(
             "Move to Start"
         )
+
+        # num_compute_iks_clicks = station.internal_meshcat.GetButtonClicks(
+        #     "Compute IKs"
+        # )
+
         num_execute_traj_clicks = station.internal_meshcat.GetButtonClicks(
             "Execute Trajectory"
         )
