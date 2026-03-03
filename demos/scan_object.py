@@ -7,7 +7,10 @@ from pathlib import Path
 
 import matplotlib
 
-matplotlib.use("TkAgg")  # Use interactive backend
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib.figure import Figure
+
+matplotlib.use("Agg")  # Use interactive backend
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -41,10 +44,10 @@ from utils.kuka_geo_kin import KinematicsSolver
 class State(Enum):
     IDLE = auto()
     WAITING_FOR_NEXT_SCAN = auto()
+    PLANNING_MOVE_TO_START = auto()
     MOVING_TO_START = auto()
     MOVING_ALONG_HEMISPHERE = auto()
     MOVING_DOWN_OPTICAL_AXIS = auto()
-    MOVING_AWAY_FROM_OPTICAL_AXIS = auto()
     COMPUTING_IKS = auto()
     PAUSE = auto()
     DONE = auto()
@@ -189,7 +192,7 @@ def plot_hemisphere_waypoints(
     hemisphere_radius,
     hemisphere_axis,
     output_path,
-    visualize=True,
+    visualize=False,
 ):
     # Reconstruct list of points from list of RigidTransforms
     points = np.array([wp.translation() for wp in path_waypoints])
@@ -626,8 +629,211 @@ def find_target_pose_on_hemisphere(center, latitude_deg, longitude_deg, radius):
     return target_rot, target_pos
 
 
+def check_joint_limits(trajectory_joint_poses, joint_lower_limits, joint_upper_limits):
+    """
+    Check if all joint positions in a trajectory are within specified limits.
+
+    Args:
+        trajectory_joint_poses: (7, N) array of joint positions
+        joint_lower_limits: (7,) array of lower joint limits
+        joint_upper_limits: (7,) array of upper joint limits
+
+    Returns:
+        is_valid: bool, True if all joints are within limits
+        violations: list of dicts containing violation info with keys:
+                   'joint_idx', 'waypoint_idx', 'value', 'limit_type', 'limit_value'
+    """
+    violations = []
+    num_joints, num_waypoints = trajectory_joint_poses.shape
+
+    for i in range(num_joints):
+        for j in range(num_waypoints):
+            joint_value = trajectory_joint_poses[i, j]
+
+            # Check lower limit
+            if joint_value < joint_lower_limits[i]:
+                violations.append(
+                    {
+                        "joint_idx": i,
+                        "waypoint_idx": j,
+                        "value": joint_value,
+                        "limit_type": "lower",
+                        "limit_value": joint_lower_limits[i],
+                        "violation_amount": joint_lower_limits[i] - joint_value,
+                    }
+                )
+
+            # Check upper limit
+            if joint_value > joint_upper_limits[i]:
+                violations.append(
+                    {
+                        "joint_idx": i,
+                        "waypoint_idx": j,
+                        "value": joint_value,
+                        "limit_type": "upper",
+                        "limit_value": joint_upper_limits[i],
+                        "violation_amount": joint_value - joint_upper_limits[i],
+                    }
+                )
+
+    is_valid = len(violations) == 0
+
+    if not is_valid:
+        print(colored(f"⚠ Found {len(violations)} joint limit violations:", "yellow"))
+        for v in violations[:5]:  # Show first 5 violations
+            print(
+                colored(
+                    f"  Joint {v['joint_idx']+1}, waypoint {v['waypoint_idx']}: "
+                    f"{np.rad2deg(v['value']):.2f}° violates {v['limit_type']} limit "
+                    f"{np.rad2deg(v['limit_value']):.2f}° by {np.rad2deg(v['violation_amount']):.2f}°",
+                    "yellow",
+                )
+            )
+        if len(violations) > 5:
+            print(colored(f"  ... and {len(violations) - 5} more violations", "yellow"))
+
+    return is_valid, violations
+
+
+def check_joint_velocities(
+    trajectory_joint_poses, t, max_joint_velocities=np.deg2rad(20 * np.ones(7))
+):  # Example limits in rad/s
+    """
+    Check if joint velocities in a trajectory exceed specified limits.
+
+    Args:
+        trajectory_joint_poses: (7, N) array of joint positions
+        t: (N,) array of time values
+        max_joint_velocities: (7,) array of maximum allowed joint velocities (absolute value)
+
+    Returns:
+        is_valid: bool, True if all velocities are within limits
+        violations: list of dicts containing violation info
+        velocities: (7, N-1) array of computed joint velocities
+    """
+    violations = []
+    num_joints, num_waypoints = trajectory_joint_poses.shape
+
+    # Compute velocities using finite differences
+    dt = np.diff(t)  # Shape (N-1,)
+    dq = np.diff(trajectory_joint_poses, axis=1)  # Shape (7, N-1)
+    velocities = dq / dt  # Shape (7, N-1)
+
+    # store max joint velocity across all joints and waypoints for reporting
+    max_recorded_velocity = 0.0
+
+    for i in range(num_joints):
+        for j in range(velocities.shape[1]):
+            vel_abs = np.abs(velocities[i, j])
+            max_recorded_velocity = max(max_recorded_velocity, vel_abs)
+
+            if vel_abs > max_joint_velocities[i]:
+                violations.append(
+                    {
+                        "joint_idx": i,
+                        "waypoint_idx": j,
+                        "velocity": velocities[i, j],
+                        "velocity_abs": vel_abs,
+                        "limit": max_joint_velocities[i],
+                        "violation_amount": vel_abs - max_joint_velocities[i],
+                    }
+                )
+
+    is_valid = len(violations) == 0
+
+    if not is_valid:
+        print(
+            colored(f"⚠ Found {len(violations)} joint velocity violations:", "yellow")
+        )
+        for v in violations[:5]:  # Show first 5 violations
+            print(
+                colored(
+                    f"  Joint {v['joint_idx']+1}, waypoint {v['waypoint_idx']}: "
+                    f"velocity {np.rad2deg(v['velocity']):.2f}°/s (abs: {np.rad2deg(v['velocity_abs']):.2f}°/s) "
+                    f"exceeds limit {np.rad2deg(v['limit']):.2f}°/s by {np.rad2deg(v['violation_amount']):.2f}°/s",
+                    "yellow",
+                )
+            )
+        if len(violations) > 5:
+            print(colored(f"  ... and {len(violations) - 5} more violations", "yellow"))
+
+    return is_valid, violations, max_recorded_velocity
+
+
+def save_trajectory_plots(
+    hemisphere_traj, hemisphere_t, optical_traj, optical_t, scan_idx
+):
+    """
+    Save hemisphere and optical axis trajectory plots to separate files.
+    Each plot shows 7 subplots (one per joint) showing position vs time.
+    """
+    import matplotlib
+
+    matplotlib.use("Agg", force=True)
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    joint_names = [f"Joint {i+1}" for i in range(7)]
+
+    # Save hemisphere trajectory
+    hemisphere_dir = Path(__file__).parent.parent / "outputs" / "hemisphere_paths"
+    hemisphere_dir.mkdir(parents=True, exist_ok=True)
+
+    fig_h = Figure(figsize=(10, 12))
+    FigureCanvasAgg(fig_h)
+    axes_h = fig_h.subplots(7, 1, sharex=True)
+    fig_h.suptitle(
+        f"Hemisphere Trajectory - Scan {scan_idx}", fontsize=14, fontweight="bold"
+    )
+
+    for i in range(7):
+        axes_h[i].plot(
+            hemisphere_t, np.rad2deg(hemisphere_traj[i, :]), linewidth=1.5, color="C0"
+        )
+        axes_h[i].set_ylabel(f"{joint_names[i]} (deg)", fontsize=10)
+        axes_h[i].grid(True, alpha=0.3)
+        if i == 6:
+            axes_h[i].set_xlabel("Time (s)", fontsize=10)
+
+    fig_h.tight_layout()
+    hemisphere_path = hemisphere_dir / f"scan_{scan_idx:02d}.png"
+    fig_h.savefig(hemisphere_path, dpi=150, bbox_inches="tight")
+    print(colored(f"✓ Saved hemisphere trajectory to {hemisphere_path}", "cyan"))
+
+    # Save optical axis trajectory
+    optical_dir = Path(__file__).parent.parent / "outputs" / "optical_axis_paths"
+    optical_dir.mkdir(parents=True, exist_ok=True)
+
+    fig_o = Figure(figsize=(10, 12))
+    FigureCanvasAgg(fig_o)
+    axes_o = fig_o.subplots(7, 1, sharex=True)
+    fig_o.suptitle(
+        f"Optical Axis Trajectory - Scan {scan_idx}", fontsize=14, fontweight="bold"
+    )
+
+    for i in range(7):
+        axes_o[i].plot(
+            optical_t, np.rad2deg(optical_traj[i, :]), linewidth=1.5, color="C1"
+        )
+        axes_o[i].set_ylabel(f"{joint_names[i]} (deg)", fontsize=10)
+        axes_o[i].grid(True, alpha=0.3)
+        if i == 6:
+            axes_o[i].set_xlabel("Time (s)", fontsize=10)
+
+    fig_o.tight_layout()
+    optical_path = optical_dir / f"scan_{scan_idx:02d}.png"
+    fig_o.savefig(optical_path, dpi=150, bbox_inches="tight")
+    print(colored(f"✓ Saved optical axis trajectory to {optical_path}", "cyan"))
+
+
 def generate_IK_solutions_for_path(
-    path_points, path_rots, kinematics_solver, q_init, elbow_angle
+    path_points,
+    path_rots,
+    kinematics_solver,
+    q_init,
+    elbow_angle,
+    joint_lower_limits,
+    joint_upper_limits,
 ):
     trajectory_joint_poses = []
     q_prev = (
@@ -638,6 +844,7 @@ def generate_IK_solutions_for_path(
         eef_pos = path_points[:, i]  # Shift spiral to be around the hemisphere center
         eef_rot = path_rots[i]  # Use the rotation matrix from the path
         Q = kinematics_solver.IK_for_microscope(eef_rot, eef_pos, psi=elbow_angle)
+
         q_curr = kinematics_solver.find_closest_solution(
             Q, q_prev
         )  # Choose closest solution to previous point for smoothness
@@ -647,7 +854,70 @@ def generate_IK_solutions_for_path(
 
     trajectory_joint_poses = np.array(trajectory_joint_poses).T  # Shape (7, num_points)
 
+    is_valid, num_violations = check_joint_limits(
+        trajectory_joint_poses, joint_lower_limits, joint_upper_limits
+    )
+
+    if not is_valid:
+        raise ValueError("joint limit(s) exceeded")
+
     return trajectory_joint_poses
+
+
+def plot_trajectories_side_by_side(
+    hemisphere_traj, hemisphere_t, optical_traj, optical_t, scan_idx
+):
+    """
+    Display hemisphere and optical axis trajectories side-by-side in a matplotlib window.
+    Left: 7 subplots for hemisphere trajectory (one per joint)
+    Right: 7 subplots for optical axis trajectory (one per joint)
+    Uses TkAgg backend to ensure window pops up.
+    """
+    import matplotlib
+
+    matplotlib.use("TkAgg", force=True)
+    import matplotlib.pyplot as plt
+
+    fig, axes = plt.subplots(7, 2, figsize=(16, 12), sharex="col")
+    fig.suptitle(
+        f"Scan {scan_idx} - Hemisphere (Left) vs Optical Axis (Right)",
+        fontsize=16,
+        fontweight="bold",
+    )
+
+    joint_names = [f"Joint {i+1}" for i in range(7)]
+
+    # Plot hemisphere trajectory on left column
+    for i in range(7):
+        axes[i, 0].plot(
+            hemisphere_t, np.rad2deg(hemisphere_traj[i, :]), linewidth=1.5, color="C0"
+        )
+        axes[i, 0].set_ylabel(f"{joint_names[i]} (deg)", fontsize=10)
+        axes[i, 0].grid(True, alpha=0.3)
+        if i == 0:
+            axes[i, 0].set_title(
+                "Hemisphere Trajectory", fontsize=12, fontweight="bold"
+            )
+        if i == 6:
+            axes[i, 0].set_xlabel("Time (s)", fontsize=10)
+
+    # Plot optical axis trajectory on right column
+    for i in range(7):
+        axes[i, 1].plot(
+            optical_t, np.rad2deg(optical_traj[i, :]), linewidth=1.5, color="C1"
+        )
+        axes[i, 1].set_ylabel(f"{joint_names[i]} (deg)", fontsize=10)
+        axes[i, 1].grid(True, alpha=0.3)
+        if i == 0:
+            axes[i, 1].set_title(
+                "Optical Axis Trajectory", fontsize=12, fontweight="bold"
+            )
+        if i == 6:
+            axes[i, 1].set_xlabel("Time (s)", fontsize=10)
+
+    plt.tight_layout()
+    plt.show()
+    plt.pause(0.1)  # Allow window to render
 
 
 def compute_hemisphere_traj_async(
@@ -660,6 +930,10 @@ def compute_hemisphere_traj_async(
     q_curr,
     elbow_angle,
     ik_result,
+    plot_trajectories=False,
+    scan_idx=0,
+    joint_lower_limits=None,
+    joint_upper_limits=None,
 ):
     hemisphere_points, hemisphere_rots, hemisphere_t = generate_poses_along_hemisphere(
         center=hemisphere_pos,
@@ -675,16 +949,72 @@ def compute_hemisphere_traj_async(
         kinematics_solver=kinematics_solver,
         q_init=q_curr,
         elbow_angle=elbow_angle,
+        joint_lower_limits=joint_lower_limits,
+        joint_upper_limits=joint_upper_limits,
     )
+
+    # Check to make sure velocities are within limits, if not, raise error to trigger replanning with slower speed
+    is_valid, _, max_recorded_velocity = check_joint_velocities(
+        trajectory_joint_poses, hemisphere_t
+    )
+    print(
+        colored(
+            f"Max recorded joint velocity in hemisphere trajectory: {np.rad2deg(max_recorded_velocity):.2f}°/s",
+            "blue",
+        )
+    )
+    if not is_valid:
+        raise ValueError("joint velocity limit(s) exceeded in hemisphere trajectory")
 
     # Turn into piecewise polynomial trajectory
     traj = PiecewisePolynomial.FirstOrderHold(hemisphere_t, trajectory_joint_poses)
     print(f"Trajectory start_time: {traj.start_time()}, end_time: {traj.end_time()}")
 
-    # Store results
+    # Store results (including raw data for plotting)
     ik_result["trajectory"] = traj
+    ik_result["trajectory_joint_poses"] = trajectory_joint_poses
+    ik_result["time"] = hemisphere_t
+    ik_result["scan_idx"] = scan_idx
     ik_result["ready"] = True
-    print(colored("✓ IK computation complete!", "green"))
+
+    # Generate and save hemisphere trajectory plot (non-blocking, thread-safe)
+    if plot_trajectories:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        hemisphere_dir = Path(__file__).parent.parent / "outputs" / "hemisphere_paths"
+        hemisphere_dir.mkdir(parents=True, exist_ok=True)
+
+        joint_names = [f"Joint {i+1}" for i in range(7)]
+
+        fig = Figure(figsize=(10, 12))
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(7, 1, sharex=True)
+        fig.suptitle(
+            f"Hemisphere Trajectory - Scan {scan_idx}", fontsize=14, fontweight="bold"
+        )
+
+        for i in range(7):
+            axes[i].plot(
+                hemisphere_t,
+                np.rad2deg(trajectory_joint_poses[i, :]),
+                linewidth=1.5,
+                color="C0",
+            )
+            axes[i].set_ylabel(f"{joint_names[i]} (deg)", fontsize=10)
+            axes[i].grid(True, alpha=0.3)
+            if i == 6:
+                axes[i].set_xlabel("Time (s)", fontsize=10)
+
+        fig.tight_layout()
+        hemisphere_path = hemisphere_dir / f"scan_{scan_idx:02d}.png"
+        fig.savefig(hemisphere_path, dpi=150, bbox_inches="tight")
+        print(colored(f"✓ Saved hemisphere trajectory to {hemisphere_path}", "cyan"))
+
+    print(colored("✓ Hemisphere IK computation complete!", "green"))
 
 
 def compute_optical_axis_traj_async(
@@ -693,7 +1023,12 @@ def compute_optical_axis_traj_async(
     q_curr,
     elbow_angle,
     ik_result,
+    plot_trajectories=False,
+    scan_idx=0,
+    joint_lower_limits=None,
+    joint_upper_limits=None,
 ):
+    print("q curr in compute_optical_axis_traj_async: ", np.rad2deg(q_curr).tolist())
     path_points, path_rots, t = generate_waypoints_down_optical_axis(pose_curr)
 
     trajectory_joint_poses = generate_IK_solutions_for_path(
@@ -702,21 +1037,85 @@ def compute_optical_axis_traj_async(
         kinematics_solver=kinematics_solver,
         q_init=q_curr,
         elbow_angle=elbow_angle,
+        joint_lower_limits=joint_lower_limits,
+        joint_upper_limits=joint_upper_limits,
     )
 
-    # append trajectory to itself but reverese the waypoints to move back up the optical axis
+    # # append trajectory to itself but reverese the waypoints to move back up the optical axis
     trajectory_joint_poses = np.hstack(
         (trajectory_joint_poses, trajectory_joint_poses[:, ::-1])
     )
     t = np.hstack((t, t + t[-1] + t[1]))  # Time for returning back up the optical axis
+
+    # Check to make sure velocities are within limits, if not, raise error to trigger replanning with slower speed
+    is_valid, _, _ = check_joint_velocities(trajectory_joint_poses, t)
+
+    if not is_valid:
+        raise ValueError("joint velocity limit(s) exceeded in hemisphere trajectory")
+
     traj = PiecewisePolynomial.FirstOrderHold(t, trajectory_joint_poses)
 
+    # Store results (including raw data for plotting)
     ik_result["trajectory"] = traj
+    ik_result["trajectory_joint_poses"] = trajectory_joint_poses
+    ik_result["time"] = t
+    ik_result["scan_idx"] = scan_idx
     ik_result["ready"] = True
+
+    # Generate and save optical axis trajectory plot (non-blocking, thread-safe)
+    if plot_trajectories:
+        import matplotlib
+
+        matplotlib.use("Agg", force=True)
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+
+        optical_dir = Path(__file__).parent.parent / "outputs" / "optical_axis_paths"
+        optical_dir.mkdir(parents=True, exist_ok=True)
+
+        joint_names = [f"Joint {i+1}" for i in range(7)]
+
+        fig = Figure(figsize=(10, 12))
+        FigureCanvasAgg(fig)
+        axes = fig.subplots(7, 1, sharex=True)
+        fig.suptitle(
+            f"Optical Axis Trajectory - Scan {scan_idx}", fontsize=14, fontweight="bold"
+        )
+
+        for i in range(7):
+            axes[i].plot(
+                t, np.rad2deg(trajectory_joint_poses[i, :]), linewidth=1.5, color="C1"
+            )
+            axes[i].set_ylabel(f"{joint_names[i]} (deg)", fontsize=10)
+            axes[i].grid(True, alpha=0.3)
+            if i == 6:
+                axes[i].set_xlabel("Time (s)", fontsize=10)
+
+        fig.tight_layout()
+        optical_path = optical_dir / f"scan_{scan_idx:02d}.png"
+        fig.savefig(optical_path, dpi=150, bbox_inches="tight")
+        print(colored(f"✓ Saved optical axis trajectory to {optical_path}", "cyan"))
+
     print(colored("✓ Optical axis IK computation complete!", "green"))
 
 
 def main(use_hardware: bool) -> None:
+    # Clean up trajectory output folders
+    import shutil
+
+    hemisphere_paths_dir = Path(__file__).parent.parent / "outputs" / "hemisphere_paths"
+    optical_axis_paths_dir = (
+        Path(__file__).parent.parent / "outputs" / "optical_axis_paths"
+    )
+
+    if hemisphere_paths_dir.exists():
+        shutil.rmtree(hemisphere_paths_dir)
+        print(colored(f"✓ Cleared {hemisphere_paths_dir}", "grey"))
+
+    if optical_axis_paths_dir.exists():
+        shutil.rmtree(optical_axis_paths_dir)
+        print(colored(f"✓ Cleared {optical_axis_paths_dir}", "grey"))
+
     scenario_data = """
     directives:
     - add_directives:
@@ -743,12 +1142,28 @@ def main(use_hardware: bool) -> None:
             lcm_url: ""
     """
 
+    # Clean up trajectory output folders
+    import shutil
+
+    hemisphere_paths_dir = Path(__file__).parent.parent / "outputs" / "hemisphere_paths"
+    optical_axis_paths_dir = (
+        Path(__file__).parent.parent / "outputs" / "optical_axis_paths"
+    )
+
+    if hemisphere_paths_dir.exists():
+        shutil.rmtree(hemisphere_paths_dir)
+        print(colored(f"✓ Cleared {hemisphere_paths_dir}", "grey"))
+
+    if optical_axis_paths_dir.exists():
+        shutil.rmtree(optical_axis_paths_dir)
+        print(colored(f"✓ Cleared {optical_axis_paths_dir}", "grey"))
+
     # ==================================================================
     # Waypoint Generation Setup
     # ==================================================================
-    hemisphere_pos = np.array([0.7, 0.0, 0.444444])
+    hemisphere_pos = np.array([0.4, 0.0, 0.4])
     hemisphere_radius = 0.05
-    hemisphere_axis = np.array([-1, 0, 0])
+    hemisphere_axis = np.array([0, 0, 1])
     coverage = 0.2  # Fraction of hemisphere to cover
 
     # Generate waypoints
@@ -759,7 +1174,7 @@ def main(use_hardware: bool) -> None:
         num_scan_points=30,
         coverage=coverage,
     )
-    scan_idx = 1
+    scan_idx = 1  # Default is 1
 
     # Plot waypoints for sanity check
     heimsphere_waypoints_output_path = (
@@ -840,12 +1255,20 @@ def main(use_hardware: bool) -> None:
     simulator.set_target_realtime_rate(1.0)
 
     station.internal_meshcat.AddButton("Stop Simulation")
+    station.internal_meshcat.AddButton("Plan Move to Start")
     station.internal_meshcat.AddButton("Move to Start")
     station.internal_meshcat.AddButton("Execute Trajectory")
 
-    # Add custom sliders for latitude and longitude
-    station.internal_meshcat.AddSlider("Latitude", -90, 90, 0.1, 0)
-    station.internal_meshcat.AddSlider("Longitude", -180, 180, 0.1, 0)
+    # Add joint position sliders (in degrees for readability)
+    joint_lower_limits = station.get_internal_plant().GetPositionLowerLimits()
+    joint_upper_limits = station.get_internal_plant().GetPositionUpperLimits()
+
+    for i in range(7):
+        min_deg = np.rad2deg(joint_lower_limits[i])
+        max_deg = np.rad2deg(joint_upper_limits[i])
+        station.internal_meshcat.AddSlider(
+            f"Joint {i+1} (deg)", min_deg, max_deg, 0.1, 0
+        )
 
     # region Step 1) Solve IK for desired pose
     kinematics_solver = KinematicsSolver(station)
@@ -857,9 +1280,14 @@ def main(use_hardware: bool) -> None:
     # ====================================================================
     # Main Simulation Loop
     # ====================================================================
+    prev_state = State.IDLE
     state = State.IDLE
 
-    elbow_angle = np.pi / 2
+    elbow_angle = np.pi / 2 + np.deg2rad(
+        45
+    )  # Slightly bent elbow for better clearance, adjust as needed
+    joint_lower_limits = station.get_internal_plant().GetPositionLowerLimits()
+    joint_upper_limits = station.get_internal_plant().GetPositionUpperLimits()
 
     # Button management
     num_move_to_top_clicks = 0
@@ -878,26 +1306,72 @@ def main(use_hardware: bool) -> None:
         "trajectory_start_time": None,
     }
 
-    joint_lower_limits = station.get_internal_plant().GetPositionLowerLimits()
-    joint_upper_limits = station.get_internal_plant().GetPositionUpperLimits()
-
-    print(f"Lower limits (rad): {joint_lower_limits}")
-    print(f"Upper limits (rad): {joint_upper_limits}")
-    print(f"Lower limits (deg): {np.rad2deg(joint_lower_limits)}")
-    print(f"Upper limits (deg): {np.rad2deg(joint_upper_limits)}")
-
     while station.internal_meshcat.GetButtonClicks("Stop Simulation") < 1:
-        if state == State.WAITING_FOR_NEXT_SCAN:
-            # if station.internal_meshcat.GetButtonClicks("Execute Trajectory") > num_execute_traj_clicks:
-            #     num_execute_traj_clicks = station.internal_meshcat.GetButtonClicks("Execute Trajectory")
+        if state != prev_state:
+            print(colored(f"State changed: {prev_state} -> {state}", "grey"))
+            prev_state = state
+
+        if state == State.IDLE:
+            if station.internal_meshcat.GetButtonClicks("Plan Move to Start") > 0:
+                print(colored("Planning move to start", "cyan"))
+
+                station_context = station.GetMyContextFromRoot(simulator.get_context())
+                q_current = station.GetOutputPort("iiwa.position_measured").Eval(
+                    station_context
+                )
+
+                target_pose = hemisphere_waypoints[scan_idx - 1]
+                target_rot = target_pose.rotation().matrix()
+                target_pos = target_pose.translation()
+
+                Q = kinematics_solver.IK_for_microscope(
+                    target_rot, target_pos, psi=elbow_angle
+                )
+
+                # Step 2) Find IK closest to current joint values
+                station_context = station.GetMyContextFromRoot(simulator.get_context())
+                q_curr = station.GetOutputPort("iiwa.position_measured").Eval(
+                    station_context
+                )
+                q_des = kinematics_solver.find_closest_solution(Q, q_curr)
+
+                print(
+                    colored(
+                        f"Goal joint configuration for Start: {np.rad2deg(q_des)}",
+                        "yellow",
+                    )
+                )
+
+                trajectory = create_traj_from_q1_to_q2(
+                    station,
+                    q_current,
+                    q_des,
+                )
+
+                state = State.PLANNING_MOVE_TO_START
+        elif state == State.PLANNING_MOVE_TO_START:
+            if station.internal_meshcat.GetButtonClicks("Move to Start") > 0:
+                trajectory_start_time = simulator.get_context().get_time()
+                state = State.MOVING_TO_START
+        elif state == State.WAITING_FOR_NEXT_SCAN:
+            if (
+                station.internal_meshcat.GetButtonClicks("Execute Trajectory")
+                > num_execute_traj_clicks
+            ):
+                num_execute_traj_clicks = station.internal_meshcat.GetButtonClicks(
+                    "Execute Trajectory"
+                )
+            else:
+                continue
 
             if scan_idx >= len(hemisphere_waypoints):
                 print(colored("✓ All scans complete!", "green"))
                 state = State.DONE
                 continue
 
-            print(colored(f"Preparing trajectory for scan #{scan_idx+1}", "grey"))
+            print(colored(f"Preparing trajectory for scan #{scan_idx}", "grey"))
 
+            pose_curr = hemisphere_waypoints[scan_idx - 1]  # We assume scan_idx >= 1
             pose_target = hemisphere_waypoints[scan_idx]
 
             # Get current end-effector pose from actual robot state
@@ -926,6 +1400,10 @@ def main(use_hardware: bool) -> None:
                     q_curr,
                     elbow_angle,
                     hemisphere_ik_result,
+                    True,  # plot_trajectories
+                    scan_idx,
+                    joint_lower_limits,
+                    joint_upper_limits,
                 ),
                 daemon=True,
             )
@@ -935,11 +1413,15 @@ def main(use_hardware: bool) -> None:
             optical_axis_ik_thread = threading.Thread(
                 target=compute_optical_axis_traj_async,
                 args=(
-                    pose_target,
+                    pose_curr,
                     kinematics_solver,
                     q_curr,
                     elbow_angle,
                     optical_axis_ik_result,
+                    True,  # plot_trajectories
+                    scan_idx,
+                    joint_lower_limits,
+                    joint_upper_limits,
                 ),
                 daemon=True,
             )
@@ -947,46 +1429,14 @@ def main(use_hardware: bool) -> None:
 
             state = State.COMPUTING_IKS
 
-        elif state == State.IDLE:
-            if station.internal_meshcat.GetButtonClicks("Move to Start") > 0:
-                print(colored("Moving to start", "cyan"))
-
-                station_context = station.GetMyContextFromRoot(simulator.get_context())
-                q_current = station.GetOutputPort("iiwa.position_measured").Eval(
-                    station_context
-                )
-
-                target_pose = hemisphere_waypoints[0]
-                target_rot = target_pose.rotation().matrix()
-                target_pos = target_pose.translation()
-
-                Q = kinematics_solver.IK_for_microscope(
-                    target_rot, target_pos, psi=elbow_angle
-                )
-
-                # Step 2) Find IK closest to current joint values
-                station_context = station.GetMyContextFromRoot(simulator.get_context())
-                q_curr = station.GetOutputPort("iiwa.position_measured").Eval(
-                    station_context
-                )
-                q_des = kinematics_solver.find_closest_solution(Q, q_curr)
-
-                print(colored(f"Goal joint configuration for Start: {q_des}", "yellow"))
-
-                trajectory = create_traj_from_q1_to_q2(
-                    station,
-                    q_current,
-                    q_des,
-                )
-
-                state = State.MOVING_TO_START
-                trajectory_start_time = simulator.get_context().get_time()
-
         elif state == State.COMPUTING_IKS:
             # Wait for IK computation to complete
             if hemisphere_ik_result["ready"] and optical_axis_ik_result["ready"]:
                 hemisphere_trajectory = hemisphere_ik_result["trajectory"]
                 optical_axis_trajectory = optical_axis_ik_result["trajectory"]
+
+                # Plotting already happened in the async functions (non-blocking)
+
                 trajectory_start_time = simulator.get_context().get_time()
                 print(
                     f"Simulator time when starting trajectory: {trajectory_start_time}"
@@ -994,7 +1444,7 @@ def main(use_hardware: bool) -> None:
                 print(colored("Starting trajectory execution", "yellow"))
                 scan_idx += 1
 
-                state = State.MOVING_ALONG_HEMISPHERE
+                state = State.MOVING_DOWN_OPTICAL_AXIS
 
         elif state == State.MOVING_TO_START:
             current_time = simulator.get_context().get_time()
@@ -1028,12 +1478,9 @@ def main(use_hardware: bool) -> None:
                 station.GetInputPort("iiwa.position").FixValue(
                     station_context, q_desired
                 )
-            elif traj_time <= hemisphere_trajectory.end_time() + 1:  # Wait for 1 second
-                pass
             else:
                 print(colored("✓ Hemisphere trajectory execution complete!", "green"))
-                state = State.MOVING_DOWN_OPTICAL_AXIS
-                trajectory_start_time = simulator.get_context().get_time()
+                state = State.WAITING_FOR_NEXT_SCAN
 
         elif state == State.MOVING_DOWN_OPTICAL_AXIS:
             current_time = simulator.get_context().get_time()
@@ -1047,9 +1494,12 @@ def main(use_hardware: bool) -> None:
                 station.GetInputPort("iiwa.position").FixValue(
                     station_context, q_desired
                 )
+            elif traj_time <= hemisphere_trajectory.end_time() + 1:  # Wait for 1 second
+                pass
             else:
                 print(colored("✓ Optical axis trajectory execution complete!", "green"))
-                state = State.WAITING_FOR_NEXT_SCAN
+                trajectory_start_time = simulator.get_context().get_time()
+                state = State.MOVING_ALONG_HEMISPHERE
 
         elif state == State.DONE:
             context = simulator.get_context()
@@ -1081,6 +1531,7 @@ def main(use_hardware: bool) -> None:
             with open(joint_log_pkl_path, "wb") as f:
                 pickle.dump(log_data, f)
             break
+            # pass
 
         # Update button counts
         num_move_to_top_clicks = station.internal_meshcat.GetButtonClicks(
@@ -1090,13 +1541,26 @@ def main(use_hardware: bool) -> None:
             "Execute Trajectory"
         )
 
+        # Update joint sliders to show current joint positions
+        station_context = station.GetMyContextFromRoot(simulator.get_context())
+        q_current = station.GetOutputPort("iiwa.position_measured").Eval(
+            station_context
+        )
+        for i in range(7):
+            station.internal_meshcat.SetSliderValue(
+                f"Joint {i+1} (deg)", np.rad2deg(q_current[i])
+            )
+
         simulator.AdvanceTo(simulator.get_context().get_time() + 0.01)
 
     station.internal_meshcat.DeleteButton("Stop Simulation")
+    station.internal_meshcat.DeleteButton("Plan Move to Start")
     station.internal_meshcat.DeleteButton("Move to Start")
     station.internal_meshcat.DeleteButton("Execute Trajectory")
-    station.internal_meshcat.DeleteSlider("Latitude")
-    station.internal_meshcat.DeleteSlider("Longitude")
+
+    # Delete joint sliders
+    for i in range(7):
+        station.internal_meshcat.DeleteSlider(f"Joint {i+1} (deg)")
 
 
 if __name__ == "__main__":
