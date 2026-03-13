@@ -10,6 +10,94 @@ from typing import Tuple, Union
 import numpy as np
 
 
+def get_sew_joint_positions(plant, context):
+    """
+    Extract the world positions of joints 2, 4, and 6 from the plant context.
+
+    Args:
+        plant: The MultibodyPlant containing the iiwa.
+        context: The plant context.
+
+    Returns:
+        p_J2, p_J4, p_J6: 3x1 positions.
+    """
+    p_J2 = plant.GetFrameByName("iiwa_link_2").CalcPoseInWorld(context).translation()
+    p_J4 = plant.GetFrameByName("iiwa_link_4").CalcPoseInWorld(context).translation()
+    p_J6 = plant.GetFrameByName("iiwa_link_6").CalcPoseInWorld(context).translation()
+    return p_J2, p_J4, p_J6
+
+
+def compute_sew_and_ref_matrices(p_J2, p_J4, p_J6, r, v):
+    """
+    Compute the SEW plane and Reference plane rotation matrices as numpy arrays.
+
+    Args:
+        p_J2, p_J4, p_J6: 3x1 positions of joints 2, 4, 6
+        r, v: Reference vectors for the reference plane
+
+    Returns:
+        R_WP: 3x3 array for SEW plane (columns: [x, y, normal]) or None
+        R_WR: 3x3 array for Reference plane (columns: [e_SW, ex, ref_normal]) or None
+    """
+    # SEW plane
+    v24 = p_J4 - p_J2
+    v26 = p_J6 - p_J2
+    normal = np.cross(v26, v24)
+    norm_val = np.linalg.norm(normal)
+    R_WP = None
+    if norm_val > 1e-4:
+        normal = normal / norm_val
+        x_axis = v24 / np.linalg.norm(v24)
+        y_axis = np.cross(normal, x_axis)
+        R_WP = np.column_stack([x_axis, y_axis, normal])
+
+    # Ref plane
+    p_SW = p_J6 - p_J2
+    norm_SW = np.linalg.norm(p_SW)
+    R_WR = None
+    if norm_SW > 1e-4:
+        e_SW = p_SW / norm_SW
+        kr = np.cross(e_SW - r, v)
+        norm_kr = np.linalg.norm(kr)
+        if norm_kr > 1e-4:
+            kr_unit = kr / norm_kr
+            kx = np.cross(kr_unit, e_SW)
+            norm_kx = np.linalg.norm(kx)
+            if norm_kx > 1e-4:
+                ex = kx / norm_kx
+                ref_normal = np.cross(e_SW, ex)
+                R_WR = np.column_stack([e_SW, ex, ref_normal])
+
+    return R_WP, R_WR
+
+
+def compute_psi_from_matrices(R_WP, R_WR):
+    """
+    Compute the signed PSI angle between the SEW plane normal and the reference plane normal.
+
+    Args:
+        R_WP: 3x3 array for SEW plane (columns: [x, y, normal])
+        R_WR: 3x3 array for Reference plane (columns: [e_SW, ex, ref_normal])
+
+    Returns:
+        psi_rad: The signed PSI angle in radians.
+    """
+    if R_WP is None or R_WR is None:
+        return 0.0
+
+    # n_hat_sew is the 3rd column of R_WP
+    n_hat_sew = R_WP[:, 2]
+    # n_hat_ref is the 3rd column of R_WR
+    n_hat_ref = R_WR[:, 2]
+    # e_SW is the 1st column of R_WR
+    e_SW = R_WR[:, 0]
+
+    cross_dot = np.dot(n_hat_sew, np.cross(e_SW, n_hat_ref))
+    dot_product = np.dot(n_hat_sew, n_hat_ref)
+    psi_rad = np.arctan2(cross_dot, dot_product)
+    return psi_rad
+
+
 def vec_normalize(vec):
     """
     Normalize a vector to unit length.

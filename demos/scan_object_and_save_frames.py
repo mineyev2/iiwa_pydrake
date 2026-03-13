@@ -1079,7 +1079,6 @@ def compute_optical_axis_traj_async(
     joint_upper_limits=None,
     distance: float = 0.025,
 ):
-    print("q curr in compute_optical_axis_traj_async: ", np.rad2deg(q_curr).tolist())
     path_points, path_rots, t = generate_waypoints_down_optical_axis(
         pose_curr, distance=distance
     )

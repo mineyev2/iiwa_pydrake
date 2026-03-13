@@ -227,15 +227,16 @@ class InternalStationDiagram(Diagram):
             collision=False,
         )
 
-        # leeway = 0.02
-        # add_sphere(  # collision sphere within scan_sphere
-        #     self._plant,
-        #     name="collision_vis_sphere",
-        #     position=self.hemisphere_pos,
-        #     radius=self.hemisphere_radius - leeway,
-        #     color=[1.0, 0.0, 0.0, 0.2],
-        #     collision=False,
-        # )
+        # add sphere to visualize collisions
+        leeway = 0.02  # space to give microscope tip to avoid collision
+        add_sphere(
+            self._plant,
+            name="collision_sphere",
+            position=self.hemisphere_pos,
+            radius=self.hemisphere_radius - leeway,
+            color=[1.0, 1.0, 1.0, 1.0],
+            collision=False,
+        )
 
         self._plant.Finalize()
 
@@ -307,13 +308,13 @@ class InternalStationDiagram(Diagram):
             radius=self.hemisphere_radius,
             collision=False,
         )
-        leeway = 0.02
+
+        leeway = 0.02  # space to give microscope tip to avoid collision
         add_sphere(  # collision sphere within scan_sphere
             self._optimization_plant,
             name="collision_sphere",
             position=self.hemisphere_pos,
             radius=self.hemisphere_radius - leeway,
-            color=[1.0, 0.0, 0.0, 0.2],
             collision=True,
         )
 
@@ -553,6 +554,12 @@ class IiwaHardwareStationDiagram(Diagram):
 
     def get_internal_plant_context(self) -> Context:
         return self.internal_station.get_plant_context()
+
+    def get_optimization_diagram_sg(self):
+        return self.internal_station.get_optimization_diagram_sg()
+
+    def get_optimization_diagram_sg_context(self) -> Context:
+        return self.internal_station.get_optimization_diagram_sg_context()
 
     def get_iiwa_controller_plant(self) -> MultibodyPlant:
         return self.internal_station.get_iiwa_controller_plant()

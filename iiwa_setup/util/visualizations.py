@@ -79,18 +79,25 @@ def add_floor(plant):
     )
 
 
-def add_wall(plant):
+def add_wall(plant, X_WF=None):
+    if not hasattr(add_wall, "counter"):
+        add_wall.counter = 0
+
+    add_wall.counter += 1
+
     friction = CoulombFriction(static_friction=0.9, dynamic_friction=0.8)
     wall_thickness = 0.01
     wall_height = 1.5
     wall_size = Box(wall_thickness, 3.0, wall_height)
-    X_WF = RigidTransform([-0.3 - wall_thickness / 2, 0, wall_height / 2])
+
+    if X_WF is None:
+        X_WF = RigidTransform([-0.3 - wall_thickness / 2, 0, wall_height / 2])
 
     plant.RegisterCollisionGeometry(
         plant.world_body(),
         X_WF,
         wall_size,
-        "wall_collision",
+        f"wall_{add_wall.counter}_collision",
         friction,
     )
 
@@ -99,6 +106,6 @@ def add_wall(plant):
         plant.world_body(),
         X_WF,
         wall_size,
-        "wall_visual",
+        f"wall_{add_wall.counter}_visual",
         [58 / 255.0, 85 / 255.0, 69 / 255.0, 0.3],
     )
