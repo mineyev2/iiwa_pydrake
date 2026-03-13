@@ -46,7 +46,7 @@ def hemisphere_slerp(A, B, center, radius, speed_factor=1.0):
     t_final = (
         arc_length * 125 / speed_factor
     )  # Scale by speed factor to make it faster or slower
-    num_points = int(t_final * 500)  # 500Hz update rate seems good
+    num_points = int(t_final * 40)
 
     t = np.linspace(0, t_final, num_points)
 
@@ -394,6 +394,8 @@ def compute_hemisphere_traj_async(
         speed_factor=speed_factor,
     )
 
+    # print("Number of points in path: ", len(hemisphere_points.T))
+
     trajectory_joint_poses = generate_IK_solutions_for_path(
         path_points=hemisphere_points,
         path_rots=hemisphere_rots,
@@ -405,7 +407,9 @@ def compute_hemisphere_traj_async(
     )
 
     # Turn into piecewise polynomial trajectory
-    traj = PiecewisePolynomial.FirstOrderHold(hemisphere_t, trajectory_joint_poses)
+    traj = PiecewisePolynomial.CubicShapePreserving(
+        hemisphere_t, trajectory_joint_poses
+    )
     print(f"Trajectory start_time: {traj.start_time()}, end_time: {traj.end_time()}")
 
     # Store results (including raw data for plotting)
@@ -480,7 +484,7 @@ def compute_optical_axis_traj_async(
     )
     t = np.hstack((t, t + t[-1] + t[1]))  # Time for returning back up the optical axis
 
-    traj = PiecewisePolynomial.FirstOrderHold(t, trajectory_joint_poses)
+    traj = PiecewisePolynomial.CubicShapePreserving(t, trajectory_joint_poses)
 
     # Store results (including raw data for plotting)
     ik_result["trajectory"] = traj

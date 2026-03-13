@@ -40,6 +40,7 @@ from pydrake.all import (  # MeshcatVisualizer,
     Parser,
     ProcessModelDirectives,
     RigidTransform,
+    RotationMatrix,
     SceneGraph,
     StartMeshcat,
     State,
@@ -217,6 +218,10 @@ class InternalStationDiagram(Diagram):
         self.hemisphere_radius = hemisphere_radius
         add_floor(self._plant)
         add_wall(self._plant)
+        add_wall(
+            self._plant,
+            X_WF=RigidTransform(self.hemisphere_pos + np.array([0.005, 0, 0.0])),
+        )
 
         add_sphere(  # scanning sphere for visualization
             self._plant,
@@ -299,6 +304,10 @@ class InternalStationDiagram(Diagram):
         # Add other world geometry (e.g., floor, wall, etc.)
         add_floor(self._optimization_plant)
         add_wall(self._optimization_plant)
+        add_wall(
+            self._optimization_plant,
+            X_WF=RigidTransform(self.hemisphere_pos + np.array([0.005, 0, 0.0])),
+        )
 
         # Add sphere to visualize scan points
         add_sphere(

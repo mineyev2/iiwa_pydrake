@@ -35,11 +35,18 @@ from pydrake.all import (
     RigidTransform,
     RotationMatrix,
     Simulator,
+    Solve,
 )
 from termcolor import colored
 
 from iiwa_setup.iiwa import IiwaForwardKinematics, IiwaHardwareStationDiagram
-from iiwa_setup.util.traj_planning import create_traj_from_q1_to_q2
+from iiwa_setup.util.traj_planning import (
+    add_collision_constraints_to_trajectory,
+    create_traj_from_q1_to_q2,
+    resolve_with_toppra,
+    setup_trajectory_optimization_from_q1_to_q2,
+)
+from iiwa_setup.util.visualizations import draw_triad
 from utils.kuka_geo_kin import KinematicsSolver
 from utils.planning import (
     compute_hemisphere_traj_async,
@@ -58,7 +65,6 @@ from utils.plotting import (
     plot_trajectories_side_by_side,
     save_trajectory_plots,
 )
-from utils.safety import check_joint_limits, check_joint_velocities
 from utils.sew_stereo import (
     compute_psi_from_matrices,
     compute_sew_and_ref_matrices,
@@ -141,7 +147,10 @@ def main(
     distance_along_optical_axis = 0.025
     num_pictures = 30
     elbow_angle = np.deg2rad(135)
-    scan_idx = 1  # Default is 1
+    scan_idx = 34  # Default is 1
+
+    vel_limits = np.full(7, 1.0)  # rad/s
+    acc_limits = np.full(7, 1.0)  # rad/s^2
 
     r = np.array([0, 0, -1])
     v = np.array([0, 1, 0])
@@ -475,10 +484,65 @@ def main(
                 )
                 q_des = kinematics_solver.find_closest_solution(Q, q_curr)
 
-                trajectory = create_traj_from_q1_to_q2(
+                # initial_trajectory = create_traj_from_q1_to_q2(
+                #     station,
+                #     q_initial,
+                #     q_des,
+                # )
+
+                (
+                    trajopt,
+                    prog,
+                    traj_plot_state,
+                ) = setup_trajectory_optimization_from_q1_to_q2(
+                    station=station,
+                    q1=q_initial,
+                    q2=q_des,
+                    vel_limits=vel_limits,
+                    acc_limits=acc_limits,
+                    duration_constraints=(0.5, 5.0),
+                    num_control_points=10,
+                    duration_cost=1.0,
+                    path_length_cost=1.0,
+                    visualize_solving=True,
+                )
+
+                # Solve for initial guess
+                traj_plot_state["rgba"] = Rgba(
+                    1, 0.5, 0, 1
+                )  # Set initial guess color to orange
+                result = Solve(prog)
+                if not result.is_success():
+                    print("Trajectory optimization failed, even without collisions!")
+                    print(result.get_solver_id().name())
+                trajopt.SetInitialGuess(trajopt.ReconstructTrajectory(result))
+
+                trajopt = add_collision_constraints_to_trajectory(
                     station,
-                    q_initial,
-                    q_des,
+                    trajopt,
+                )
+
+                traj_plot_state["rgba"] = Rgba(
+                    0, 1, 0, 1
+                )  # Set final trajectory color to green
+                result = Solve(prog)
+                if not result.is_success():
+                    print("Trajectory optimization failed")
+                    print(result.get_solver_id().name())
+                    continue
+
+                print("Final trajectory optimization succeeded!")
+
+                initial_trajectory = resolve_with_toppra(  # At this point all this is doing is time-optimizing to make the traj as fast as possible
+                    station,
+                    trajopt,
+                    result,
+                    vel_limits,
+                    acc_limits,
+                )
+
+                print(
+                    f"✓ TOPPRA succeeded! Trajectory duration: {initial_trajectory.end_time():.2f}s"
                 )
 
                 state = State.PLANNING_MOVE_TO_START
@@ -506,6 +570,26 @@ def main(
 
             pose_curr = hemisphere_waypoints[scan_idx - 1]  # We assume scan_idx >= 1
             pose_target = hemisphere_waypoints[scan_idx]
+
+            # # Visualize the target scan point as a triad for reference
+            offset = np.array(
+                [
+                    [0, -1, 0],
+                    [-1, 0, 0],
+                    [0, 0, -1],
+                ]
+            )
+            offset = RotationMatrix(offset)
+            offset = RigidTransform(offset)
+            pose_target = pose_target @ offset
+
+            draw_triad(
+                station.internal_meshcat,
+                "next_scan_target",
+                pose_target,
+                length=0.1,
+                radius=0.002,
+            )
 
             # Get current end-effector pose from actual robot state
             station_context = station.GetMyContextFromRoot(simulator.get_context())
@@ -582,6 +666,16 @@ def main(
                     state = State.PLANNING_ALONG_ALTERNATE_PATH
                     continue
 
+                if not hemisphere_ik_result["valid_velocities"]:
+                    print(
+                        colored(
+                            "❌ Invalid joint velocities. Taking alternate path to next scan point",
+                            "yellow",
+                        )
+                    )
+                    state = State.PLANNING_ALONG_ALTERNATE_PATH
+                    continue
+
                 if not optical_axis_ik_result["valid_joints"]:
                     print(
                         colored(
@@ -591,29 +685,26 @@ def main(
                     )
                     break
 
-                if not hemisphere_ik_result["valid_collisions"]:
-                    print(
-                        colored(
-                            "❌ Collision detected in hemisphere trajectory. Taking alternate path to next scan point",
-                            "yellow",
-                        )
-                    )
-                    state = State.PLANNING_ALONG_ALTERNATE_PATH
-                    break
+                # if not hemisphere_ik_result["valid_collisions"]:
+                #     print(
+                #         colored(
+                #             "❌ Collision detected in hemisphere trajectory. Taking alternate path to next scan point",
+                #             "yellow",
+                #         )
+                #     )
+                #     # state = State.PLANNING_ALONG_ALTERNATE_PATH
+                #     break
 
-                if not optical_axis_ik_result["valid_collisions"]:
-                    print(
-                        colored(
-                            "❌ Collision detected in optical axis IK. Quitting program.",
-                            "red",
-                        )
-                    )
-                    break
+                # if not optical_axis_ik_result["valid_collisions"]:
+                #     print(
+                #         colored(
+                #             "❌ Collision detected in optical axis IK. Quitting program.",
+                #             "red",
+                #         )
+                #     )
+                #     break
 
-                if (
-                    not hemisphere_ik_result["valid_velocities"]
-                    or not optical_axis_ik_result["valid_velocities"]
-                ):
+                if not optical_axis_ik_result["valid_velocities"]:
                     print(
                         colored("❌ Invalid joint velocities. Quitting program.", "red")
                     )
@@ -678,10 +769,50 @@ def main(
                 station_context
             )
 
-            traj_to_start = create_traj_from_q1_to_q2(
-                station,
-                q_current,
-                q_initial,
+            # Step 1: Optimize trajectory from current position to q_initial
+            (
+                trajopt_start,
+                prog_start,
+                traj_plot_state_start,
+            ) = setup_trajectory_optimization_from_q1_to_q2(
+                station=station,
+                q1=q_current,
+                q2=q_initial,
+                vel_limits=vel_limits,
+                acc_limits=acc_limits,
+                duration_constraints=(0.5, 5.0),
+                num_control_points=10,
+                duration_cost=1.0,
+                path_length_cost=1.0,
+                visualize_solving=True,
+            )
+
+            traj_plot_state_start["rgba"] = Rgba(1, 0.5, 0, 1)
+            result_start = Solve(prog_start)
+            if not result_start.is_success():
+                print(colored("Trajectory optimization to start failed!", "red"))
+                continue
+
+            trajopt_start.SetInitialGuess(
+                trajopt_start.ReconstructTrajectory(result_start)
+            )
+            trajopt_start = add_collision_constraints_to_trajectory(
+                station, trajopt_start
+            )
+
+            traj_plot_state_start["rgba"] = Rgba(0, 1, 0, 1)
+            result_start = Solve(prog_start)
+            if not result_start.is_success():
+                print(
+                    colored(
+                        "Trajectory optimization to start failed with collisions constraints!",
+                        "red",
+                    )
+                )
+                continue
+
+            traj_to_start = resolve_with_toppra(
+                station, trajopt_start, result_start, vel_limits, acc_limits
             )
 
             target_pose = hemisphere_waypoints[scan_idx]
@@ -694,10 +825,50 @@ def main(
 
             q_des = kinematics_solver.find_closest_solution(Q, q_initial)
 
-            traj_to_next_scan = create_traj_from_q1_to_q2(
-                station,
-                q_initial,
-                q_des,
+            # Step 2: Optimize trajectory from q_initial to q_des
+            (
+                trajopt_next,
+                prog_next,
+                traj_plot_state_next,
+            ) = setup_trajectory_optimization_from_q1_to_q2(
+                station=station,
+                q1=q_initial,
+                q2=q_des,
+                vel_limits=vel_limits,
+                acc_limits=acc_limits,
+                duration_constraints=(0.5, 5.0),
+                num_control_points=10,
+                duration_cost=1.0,
+                path_length_cost=1.0,
+                visualize_solving=True,
+            )
+
+            traj_plot_state_next["rgba"] = Rgba(1, 0.5, 0, 1)
+            result_next = Solve(prog_next)
+            if not result_next.is_success():
+                print(colored("Trajectory optimization to next scan failed!", "red"))
+                continue
+
+            trajopt_next.SetInitialGuess(
+                trajopt_next.ReconstructTrajectory(result_next)
+            )
+            trajopt_next = add_collision_constraints_to_trajectory(
+                station, trajopt_next
+            )
+
+            traj_plot_state_next["rgba"] = Rgba(0, 1, 0, 1)
+            result_next = Solve(prog_next)
+            if not result_next.is_success():
+                print(
+                    colored(
+                        "Trajectory optimization to next scan failed with collisions constraints!",
+                        "red",
+                    )
+                )
+                continue
+
+            traj_to_next_scan = resolve_with_toppra(
+                station, trajopt_next, result_next, vel_limits, acc_limits
             )
 
             state = State.MOVING_ALONG_ALTERNATE_PATH
@@ -736,8 +907,8 @@ def main(
             current_time = simulator.get_context().get_time()
             traj_time = current_time - trajectory_start_time
 
-            if traj_time <= trajectory.end_time():
-                q_desired = trajectory.value(traj_time)
+            if traj_time <= initial_trajectory.end_time():
+                q_desired = initial_trajectory.value(traj_time)
                 station_context = station.GetMyMutableContextFromRoot(
                     simulator.get_mutable_context()
                 )
