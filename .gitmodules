@@ -1,0 +1,3 @@
+[submodule "microscope-data"]
+	path = microscope-data
+	url = https://huggingface.co/datasets/microscope-project/microscope-data

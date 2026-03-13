@@ -22,6 +22,7 @@ opencv-python = "^4.13.0.92"
 pandas = ">=2.0,<3.0"
 plotly = "^6.5.2"
 pycolmap-cuda12 = "^3.13.0"
+huggingface-hub = "^1.7.1"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "^3.4.0"
