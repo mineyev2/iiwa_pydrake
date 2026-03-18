@@ -145,7 +145,7 @@ def main(
     num_scan_points = 50
     coverage = 0.40  # Fraction of hemisphere to cover
     distance_along_optical_axis = 0.025
-    num_pictures = 1  # Default is 30
+    num_pictures = 30  # Default is 30
     elbow_angle = np.deg2rad(135)
     scan_idx = 1  # Default is 1
 
@@ -576,20 +576,16 @@ def main(
                     state = State.IDLE
 
         elif state == State.PLANNING_MOVE_TO_START:
-            # if station.internal_meshcat.GetButtonClicks("Move to Start") <= 0:
-            #     continue
+            if station.internal_meshcat.GetButtonClicks("Move to Start") <= 0:
+                continue
 
             trajectory_start_time = simulator.get_context().get_time()
             state = State.MOVING_TO_START
         elif state == State.WAITING_FOR_NEXT_SCAN:
             # if (
-            #     station.internal_meshcat.GetButtonClicks("Compute IKs")
-            #     > num_compute_iks_clicks
+            #     station.internal_meshcat.GetButtonClicks("Execute Trajectory")
+            #     <= num_execute_traj_clicks
             # ):
-            #     num_compute_iks_clicks = station.internal_meshcat.GetButtonClicks(
-            #         "Compute IKs"
-            #     )
-            # else:
             #     continue
 
             if scan_idx >= len(hemisphere_waypoints):
@@ -718,12 +714,6 @@ def main(
 
                 # Plotting already happened in the async functions (non-blocking)
 
-                trajectory_start_time = simulator.get_context().get_time()
-                print(
-                    f"Simulator time when starting trajectory: {trajectory_start_time}"
-                )
-                print(colored("Starting trajectory execution", "yellow"))
-
                 # ----------------------------------------------------------
                 # Compute the halfway point of the optical axis trajectory
                 # (the trajectory is mirrored: first half goes inward, second
@@ -762,7 +752,11 @@ def main(
                 scan_idx += 1
 
                 state = State.MOVING_DOWN_OPTICAL_AXIS
-                # state = State.MOVING_ALONG_HEMISPHERE
+                trajectory_start_time = simulator.get_context().get_time()
+                print(
+                    f"Simulator time when starting trajectory: {trajectory_start_time}"
+                )
+                print(colored("Starting trajectory execution", "yellow"))
 
         elif state == State.PLANNING_ALONG_ALTERNATE_PATH:
             print(colored("Planning alternate path (async)", "cyan"))
@@ -794,6 +788,7 @@ def main(
                     vel_limits,
                     acc_limits,
                     alternate_gcs_result,
+                    True,
                 ),
                 daemon=True,
             )
@@ -826,9 +821,14 @@ def main(
                     trajectory_start_time = simulator.get_context().get_time()
                     state = State.MOVING_ALONG_ALTERNATE_PATH
                 else:
-                    print(colored("❌ GCS planning failed!", "red"))
-                    # Fallback or retry logic could go here
-                    state = State.DONE  # Stop for now if planning fails
+                    print(
+                        colored(
+                            "❌ GCS planning failed, incrementing scan index to skip to next scan point",
+                            "yellow",
+                        )
+                    )
+                    scan_idx += 1
+                    state = State.WAITING_FOR_NEXT_SCAN
 
         elif state == State.MOVING_ALONG_ALTERNATE_PATH:
             # need to follow traj_to_start, and then traj_to_next_scan
@@ -998,12 +998,15 @@ def main(
                 print(colored("✓ Optical axis trajectory execution complete!", "green"))
                 trajectory_start_time = simulator.get_context().get_time()
 
-                # if (hemisphere_ik_result["valid_joints"] and hemisphere_ik_result["valid_velocities"]):
-                #     state = State.MOVING_ALONG_HEMISPHERE
-                # else:
-                #     state = State.PLANNING_ALONG_ALTERNATE_PATH
+                if (
+                    hemisphere_ik_result["valid_joints"]
+                    and hemisphere_ik_result["valid_velocities"]
+                ):
+                    state = State.MOVING_ALONG_HEMISPHERE
+                else:
+                    state = State.PLANNING_ALONG_ALTERNATE_PATH
 
-                state = State.PLANNING_ALONG_ALTERNATE_PATH
+                # state = State.PLANNING_ALONG_ALTERNATE_PATH
 
         elif state == State.DONE:
             context = simulator.get_context()
@@ -1038,9 +1041,9 @@ def main(
             # pass
 
         # Update button counts
-        num_move_to_top_clicks = station.internal_meshcat.GetButtonClicks(
-            "Move to Start"
-        )
+        # num_move_to_top_clicks = station.internal_meshcat.GetButtonClicks(
+        #     "Move to Start"
+        # )
 
         # num_compute_iks_clicks = station.internal_meshcat.GetButtonClicks(
         #     "Compute IKs"

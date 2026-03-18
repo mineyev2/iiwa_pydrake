@@ -228,15 +228,15 @@ class InternalStationDiagram(Diagram):
         )
 
         add_floor(self._plant)
-        # add_wall(self._plant)
+        add_wall(self._plant)
 
-        # hemisphere_wall_rot = RotationMatrix.MakeZRotation(self.hemisphere_angle)
-        # add_wall(
-        #     self._plant,
-        #     X_WF=RigidTransform(
-        #         hemisphere_wall_rot, self.hemisphere_pos + np.array([0.0, 0.005, 0.0])
-        #     ),
-        # )
+        hemisphere_wall_rot = RotationMatrix.MakeZRotation(self.hemisphere_angle)
+        add_wall(
+            self._plant,
+            X_WF=RigidTransform(
+                hemisphere_wall_rot, self.hemisphere_pos + np.array([0.0, 0.005, 0.0])
+            ),
+        )
 
         add_sphere(  # scanning sphere for visualization
             self._plant,
@@ -247,16 +247,16 @@ class InternalStationDiagram(Diagram):
             collision=False,
         )
 
-        # # add sphere to visualize collisions
-        # obj_radius = 0.05  # space to give microscope tip to avoid collision
-        # add_sphere(
-        #     self._plant,
-        #     name="collision_sphere",
-        #     position=self.hemisphere_pos,
-        #     radius=obj_radius,
-        #     color=[1.0, 1.0, 1.0, 1.0],
-        #     collision=False,
-        # )
+        # add sphere to visualize collisions
+        obj_radius = 0.05  # space to give microscope tip to avoid collision
+        add_sphere(
+            self._plant,
+            name="collision_sphere",
+            position=self.hemisphere_pos,
+            radius=obj_radius,
+            color=[1.0, 1.0, 1.0, 1.0],
+            collision=False,
+        )
 
         self._plant.Finalize()
 
@@ -323,31 +323,31 @@ class InternalStationDiagram(Diagram):
 
         # Add other world geometry (e.g., floor, wall, etc.)
         add_floor(self._optimization_plant)
-        # add_wall(self._optimization_plant)
-        # add_wall(
-        #     self._optimization_plant,
-        #     X_WF=RigidTransform(
-        #         hemisphere_wall_rot, self.hemisphere_pos + np.array([0.0, 0.005, 0.0])
-        #     ),
-        # )
+        add_wall(self._optimization_plant)
+        add_wall(
+            self._optimization_plant,
+            X_WF=RigidTransform(
+                hemisphere_wall_rot, self.hemisphere_pos + np.array([0.0, 0.005, 0.0])
+            ),
+        )
 
-        # # Add sphere to visualize scan points
-        # add_sphere(
-        #     self._optimization_plant,
-        #     name="scan_sphere",
-        #     position=self.hemisphere_pos,
-        #     radius=self.hemisphere_radius,
-        #     collision=False,
-        # )
+        # Add sphere to visualize scan points
+        add_sphere(
+            self._optimization_plant,
+            name="scan_sphere",
+            position=self.hemisphere_pos,
+            radius=self.hemisphere_radius,
+            collision=False,
+        )
 
-        # # leeway = 0.05  # space to give microscope tip to avoid collision
-        # add_sphere(  # collision sphere within scan_sphere
-        #     self._optimization_plant,
-        #     name="collision_sphere",
-        #     position=self.hemisphere_pos,
-        #     radius=obj_radius,
-        #     collision=True,
-        # )
+        # leeway = 0.05  # space to give microscope tip to avoid collision
+        add_sphere(  # collision sphere within scan_sphere
+            self._optimization_plant,
+            name="collision_sphere",
+            position=self.hemisphere_pos,
+            radius=obj_radius,
+            collision=True,
+        )
 
         # Finalize the plant BEFORE building the diagram
         self._optimization_plant.Finalize()

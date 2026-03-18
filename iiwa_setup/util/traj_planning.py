@@ -249,16 +249,16 @@ def setup_trajectory_optimization_from_q1_to_q2(
         station.internal_station.get_optimization_plant_context()
     )
 
-    collision_constraint = MinimumDistanceLowerBoundConstraint(
-        optimization_plant,
-        minimum_distance,
-        optimization_plant_context,
-        None,
-    )
+    # collision_constraint = MinimumDistanceLowerBoundConstraint(
+    #     optimization_plant,
+    #     minimum_distance,
+    #     optimization_plant_context,
+    #     None,
+    # )
 
-    evaluate_at_s = np.linspace(0, 1, num_samples)
-    for s in evaluate_at_s:
-        trajopt.AddPathPositionConstraint(collision_constraint, s)
+    # evaluate_at_s = np.linspace(0, 1, num_samples)
+    # for s in evaluate_at_s:
+    #     trajopt.AddPathPositionConstraint(collision_constraint, s)
 
     return trajopt, prog, guess_qs
 
@@ -335,6 +335,7 @@ def solve_kinematic_traj_opt_async(
     vel_limits: np.ndarray,
     acc_limits: np.ndarray,
     result_dict: dict,
+    check_final_trajectory=False,  # We'll check for collisions separately after reparameterization
     duration_constraints: tuple[float, float] = (0.5, 10.0),
     num_control_points: int = 10,
     duration_cost: float = 1.0,
@@ -360,6 +361,32 @@ def solve_kinematic_traj_opt_async(
         num_samples=num_samples,
         minimum_distance=minimum_distance,
     )
+
+    # check if there's collisions going down the generated trajectory
+    if success and trajectory is not None and check_final_trajectory:
+        opt_plant = station.get_optimization_plant()
+        opt_plant_context = station.internal_station.get_optimization_plant_context()
+        opt_sg = station.internal_station.get_optimization_diagram_sg()
+        opt_sg_context = station.internal_station.get_optimization_diagram_sg_context()
+
+        t_start = trajectory.start_time()
+        t_end = trajectory.end_time()
+        check_times = np.linspace(t_start, t_end, num_samples)
+
+        collision_detected = False
+        for t in check_times:
+            q = trajectory.value(t).flatten()
+            opt_plant.SetPositions(opt_plant_context, q)
+            query_object = opt_sg.get_query_output_port().Eval(opt_sg_context)
+            if query_object.HasCollisions():
+                collision_detected = True
+                break
+
+        if collision_detected:
+            print(colored("❌ Collision detected in generated trajectory!", "red"))
+            success = False
+        else:
+            print(colored("✓ No collisions detected in trajectory.", "green"))
 
     result_dict["trajectory"] = trajectory
     result_dict["success"] = success
